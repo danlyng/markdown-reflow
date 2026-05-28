@@ -1,4 +1,4 @@
-mod reflow;
+use markdown_reflow::reflow;
 
 use std::env;
 use std::fs;
