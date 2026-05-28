@@ -18,8 +18,7 @@ pub fn reflow(input: &str, target_width: usize) -> Result<String, String> {
         },
         ..markdown::ParseOptions::default()
     };
-    let mut ast =
-        markdown::to_mdast(input, &options).map_err(|e| e.to_string())?;
+    let mut ast = markdown::to_mdast(input, &options).map_err(|e| e.to_string())?;
 
     reflow_root(&mut ast, target_width);
 
@@ -738,26 +737,42 @@ fn tokens_to_spans(tokens: &[WrapToken]) -> Vec<Span> {
 
 fn reflow_root(root: &mut Node, target_width: usize) {
     if let Some(children) = root.children_mut() {
-        reflow_children(children, target_width);
+        reflow_children(children, target_width, 0);
     }
 }
 
-fn reflow_children(children: &mut Vec<Node>, target_width: usize) {
+fn reflow_children(children: &mut Vec<Node>, target_width: usize, prefix_width: usize) {
     for child in children.iter_mut() {
-        reflow_node(child, target_width);
+        reflow_node(child, target_width, prefix_width);
     }
 }
 
-fn reflow_node(node: &mut Node, target_width: usize) {
+fn reflow_node(node: &mut Node, target_width: usize, prefix_width: usize) {
     match node {
         // Paragraph: reflow phrasing content.
         Node::Paragraph(p) => {
-            reflow_paragraph(&mut p.children, target_width);
+            reflow_paragraph(&mut p.children, target_width, prefix_width);
+        }
+        // Blockquote: content is prefixed with "> " (2 chars) on every line.
+        Node::Blockquote(_) => {
+            if let Some(children) = node.children_mut() {
+                reflow_children(children, target_width, prefix_width + 2);
+            }
+        }
+        // List: each item has a marker that adds to the prefix width.
+        Node::List(list) => {
+            let start = list.start.unwrap_or(1);
+            for (idx, child) in list.children.iter_mut().enumerate() {
+                let marker = if list.ordered {
+                    format!("{}. ", start + idx as u32)
+                } else {
+                    "* ".to_string()
+                };
+                reflow_node(child, target_width, prefix_width + marker.len());
+            }
         }
         // Container nodes: recurse into children.
         Node::Root(_)
-        | Node::Blockquote(_)
-        | Node::List(_)
         | Node::ListItem(_)
         | Node::FootnoteDefinition(_)
         | Node::Table(_)
@@ -772,7 +787,7 @@ fn reflow_node(node: &mut Node, target_width: usize) {
         | Node::MdxJsxFlowElement(_)
         | Node::MdxJsxTextElement(_) => {
             if let Some(children) = node.children_mut() {
-                reflow_children(children, target_width);
+                reflow_children(children, target_width, prefix_width);
             }
         }
         // Leaf/void nodes: nothing to do.
@@ -781,7 +796,7 @@ fn reflow_node(node: &mut Node, target_width: usize) {
 }
 
 /// Reflow a paragraph's children.
-fn reflow_paragraph(children: &mut Vec<Node>, target_width: usize) {
+fn reflow_paragraph(children: &mut Vec<Node>, target_width: usize, prefix_width: usize) {
     // 1. Convert all children to spans.
     let spans: Vec<Span> = children.iter().flat_map(node_to_spans).collect();
 
@@ -789,8 +804,9 @@ fn reflow_paragraph(children: &mut Vec<Node>, target_width: usize) {
         return;
     }
 
-    // 2. Word-wrap the spans.
-    let wrapped = wrap_spans(&spans, target_width);
+    // 2. Word-wrap the spans, accounting for the prefix that rendering will add.
+    let available_width = target_width.saturating_sub(prefix_width);
+    let wrapped = wrap_spans(&spans, available_width);
 
     // 3. Merge adjacent SoftBreak + Text("\n") patterns and trim.
     let wrapped = coalesce_spans(&wrapped);
@@ -1654,4 +1670,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_list_items_respect_width() {
+        // List items should not exceed target_width after adding the bullet marker.
+        let input = "* This is a bullet point that should be reflowed to stay within the character limit.\n";
+        for width in [20, 40, 60, 80] {
+            let result = reflow(input, width).unwrap();
+            for line in result.lines() {
+                assert!(
+                    line.chars().count() <= width,
+                    "width {width}: line too long ({chars}): {line:?}",
+                    chars = line.chars().count()
+                );
+            }
+        }
     }
+
+    #[test]
+    fn test_ordered_list_items_respect_width() {
+        let input = "1. This is an ordered bullet point that should be reflowed to stay within the character limit.\n";
+        for width in [20, 40, 60, 80] {
+            let result = reflow(input, width).unwrap();
+            for line in result.lines() {
+                assert!(
+                    line.chars().count() <= width,
+                    "width {width}: line too long ({chars}): {line:?}",
+                    chars = line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_blockquote_respects_width() {
+        let input =
+            "> This is a blockquote that should be reflowed to stay within the character limit.\n";
+        for width in [20, 40, 60, 80] {
+            let result = reflow(input, width).unwrap();
+            for line in result.lines() {
+                assert!(
+                    line.chars().count() <= width,
+                    "width {width}: line too long ({chars}): {line:?}",
+                    chars = line.chars().count()
+                );
+            }
+        }
+    }
+}
