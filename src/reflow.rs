@@ -6,6 +6,37 @@ use std::fmt::Write;
 /// Paragraphs are reflowed; block-level structure (headings, list items,
 /// blockquotes, code blocks, etc.) is preserved.
 pub fn reflow(input: &str, target_width: usize) -> Result<String, String> {
+    reflow_with_initial_width(input, target_width, target_width)
+}
+
+/// Reflow the given markdown string using `initial_width` for the first
+/// reflowed line and `target_width` for later lines.
+///
+/// This is useful when the first rendered line has an external prefix, such as
+/// a comment opening delimiter, that is not present on continuation lines.
+pub fn reflow_with_initial_width(
+    input: &str,
+    initial_width: usize,
+    target_width: usize,
+) -> Result<String, String> {
+    reflow_with_edge_widths(
+        input,
+        initial_width,
+        target_width,
+        target_width,
+        initial_width,
+    )
+}
+
+/// Reflow markdown with distinct budgets for the first, middle, last, and
+/// single rendered content line.
+pub fn reflow_with_edge_widths(
+    input: &str,
+    initial_width: usize,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+) -> Result<String, String> {
     let options = markdown::ParseOptions {
         constructs: markdown::Constructs {
             gfm_table: true,
@@ -20,7 +51,13 @@ pub fn reflow(input: &str, target_width: usize) -> Result<String, String> {
     };
     let mut ast = markdown::to_mdast(input, &options).map_err(|e| e.to_string())?;
 
-    reflow_root(&mut ast, target_width);
+    reflow_root_with_edge_widths(
+        &mut ast,
+        initial_width,
+        target_width,
+        final_width,
+        single_line_width,
+    );
 
     let mut output = String::new();
     render_root(&ast, &mut output);
@@ -521,7 +558,31 @@ fn tokenize_span(span: &Span, out: &mut Vec<WrapToken>) {
 /// Given a flat list of spans, insert SoftBreak spans at word boundaries
 /// so that no line exceeds `target_width` visible characters.
 fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
-    if target_width == 0 {
+    wrap_spans_with_initial_width(spans, target_width, target_width)
+}
+
+fn wrap_spans_with_initial_width(
+    spans: &[Span],
+    initial_width: usize,
+    target_width: usize,
+) -> Vec<Span> {
+    wrap_spans_with_edge_widths(
+        spans,
+        initial_width,
+        target_width,
+        target_width,
+        initial_width,
+    )
+}
+
+fn wrap_spans_with_edge_widths(
+    spans: &[Span],
+    initial_width: usize,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+) -> Vec<Span> {
+    if initial_width == 0 || target_width == 0 || final_width == 0 || single_line_width == 0 {
         return spans.to_vec();
     }
 
@@ -532,6 +593,7 @@ fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
     // 2. Greedy line-breaking on the flat token stream.
     let mut result_tokens: Vec<WrapToken> = Vec::new();
     let mut line_width: usize = 0;
+    let mut current_target_width = initial_width;
     let mut i = 0;
 
     while i < tokens.len() {
@@ -541,6 +603,7 @@ fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
         if tok.is_hard_break() {
             result_tokens.push(tok.clone());
             line_width = 0;
+            current_target_width = target_width;
             i += 1;
             continue;
         }
@@ -562,7 +625,7 @@ fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
 
         let w = tok.width();
 
-        if line_width + w > target_width && line_width > 0 {
+        if line_width + w > current_target_width && line_width > 0 {
             // Need to break.  Search backwards for a break opportunity.
             let mut found = false;
             for j in (0..result_tokens.len()).rev() {
@@ -576,6 +639,7 @@ fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
                         result_tokens[j] = WrapToken::Word(trimmed);
                     }
                     result_tokens.insert(j + 1, WrapToken::SoftBreak);
+                    current_target_width = target_width;
 
                     // Recalculate line width for what's after the break.
                     line_width = 0;
@@ -594,6 +658,7 @@ fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
                 // No good break point; force a break before current token.
                 result_tokens.push(WrapToken::SoftBreak);
                 line_width = 0;
+                current_target_width = target_width;
                 continue;
             }
         } else {
@@ -603,8 +668,68 @@ fn wrap_spans(spans: &[Span], target_width: usize) -> Vec<Span> {
         }
     }
 
+    reserve_final_line_width(
+        &mut result_tokens,
+        target_width,
+        final_width,
+        single_line_width,
+    );
+
     // 3. Convert the token stream back to spans.
     tokens_to_spans(&result_tokens)
+}
+
+fn reserve_final_line_width(
+    tokens: &mut Vec<WrapToken>,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+) {
+    loop {
+        let line_start = tokens
+            .iter()
+            .rposition(|tok| matches!(tok, WrapToken::SoftBreak | WrapToken::HardBreak))
+            .map_or(0, |i| i + 1);
+        let single_line = line_start == 0;
+        let limit = if single_line {
+            single_line_width
+        } else {
+            final_width
+        };
+        let line_width: usize = tokens[line_start..].iter().map(WrapToken::width).sum();
+        if line_width <= limit {
+            return;
+        }
+
+        let mut suffix_width = 0;
+        let mut split_at = None;
+        for i in (line_start..tokens.len()).rev() {
+            suffix_width += tokens[i].width();
+            if suffix_width > limit {
+                break;
+            }
+            if i > line_start && tokens[i - 1].is_break_opportunity() {
+                let prefix_width: usize =
+                    tokens[line_start..i - 1].iter().map(WrapToken::width).sum();
+                let trimmed_width = match &tokens[i - 1] {
+                    WrapToken::Word(s) => s.trim_end().chars().count(),
+                    tok => tok.width(),
+                };
+                if prefix_width + trimmed_width <= target_width {
+                    split_at = Some(i - 1);
+                }
+            }
+        }
+
+        let Some(split_at) = split_at else {
+            return;
+        };
+
+        if let WrapToken::Word(s) = &mut tokens[split_at] {
+            *s = s.trim_end().to_string();
+        }
+        tokens.insert(split_at + 1, WrapToken::SoftBreak);
+    }
 }
 
 /// Reconstruct spans from a token stream, matching open/close markers.
@@ -735,28 +860,85 @@ fn tokens_to_spans(tokens: &[WrapToken]) -> Vec<Span> {
 // AST walking and reflow
 // ---------------------------------------------------------------------------
 
-fn reflow_root(root: &mut Node, target_width: usize) {
+fn reflow_root_with_edge_widths(
+    root: &mut Node,
+    initial_width: usize,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+) {
     if let Some(children) = root.children_mut() {
-        reflow_children(children, target_width, 0);
+        let mut initial_line_pending = initial_width != target_width
+            || final_width != target_width
+            || single_line_width != target_width;
+        reflow_children(
+            children,
+            initial_width,
+            target_width,
+            final_width,
+            single_line_width,
+            0,
+            &mut initial_line_pending,
+        );
     }
 }
 
-fn reflow_children(children: &mut Vec<Node>, target_width: usize, prefix_width: usize) {
+fn reflow_children(
+    children: &mut Vec<Node>,
+    initial_width: usize,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+    prefix_width: usize,
+    initial_line_pending: &mut bool,
+) {
     for child in children.iter_mut() {
-        reflow_node(child, target_width, prefix_width);
+        reflow_node(
+            child,
+            initial_width,
+            target_width,
+            final_width,
+            single_line_width,
+            prefix_width,
+            initial_line_pending,
+        );
     }
 }
 
-fn reflow_node(node: &mut Node, target_width: usize, prefix_width: usize) {
+fn reflow_node(
+    node: &mut Node,
+    initial_width: usize,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+    prefix_width: usize,
+    initial_line_pending: &mut bool,
+) {
     match node {
         // Paragraph: reflow phrasing content.
         Node::Paragraph(p) => {
-            reflow_paragraph(&mut p.children, target_width, prefix_width);
+            reflow_paragraph(
+                &mut p.children,
+                initial_width,
+                target_width,
+                final_width,
+                single_line_width,
+                prefix_width,
+                initial_line_pending,
+            );
         }
         // Blockquote: content is prefixed with "> " (2 chars) on every line.
         Node::Blockquote(_) => {
             if let Some(children) = node.children_mut() {
-                reflow_children(children, target_width, prefix_width + 2);
+                reflow_children(
+                    children,
+                    initial_width,
+                    target_width,
+                    final_width,
+                    single_line_width,
+                    prefix_width + 2,
+                    initial_line_pending,
+                );
             }
         }
         // List: each item has a marker that adds to the prefix width.
@@ -768,7 +950,15 @@ fn reflow_node(node: &mut Node, target_width: usize, prefix_width: usize) {
                 } else {
                     "* ".to_string()
                 };
-                reflow_node(child, target_width, prefix_width + marker.len());
+                reflow_node(
+                    child,
+                    initial_width,
+                    target_width,
+                    final_width,
+                    single_line_width,
+                    prefix_width + marker.len(),
+                    initial_line_pending,
+                );
             }
         }
         // Container nodes: recurse into children.
@@ -787,7 +977,15 @@ fn reflow_node(node: &mut Node, target_width: usize, prefix_width: usize) {
         | Node::MdxJsxFlowElement(_)
         | Node::MdxJsxTextElement(_) => {
             if let Some(children) = node.children_mut() {
-                reflow_children(children, target_width, prefix_width);
+                reflow_children(
+                    children,
+                    initial_width,
+                    target_width,
+                    final_width,
+                    single_line_width,
+                    prefix_width,
+                    initial_line_pending,
+                );
             }
         }
         // Leaf/void nodes: nothing to do.
@@ -796,7 +994,15 @@ fn reflow_node(node: &mut Node, target_width: usize, prefix_width: usize) {
 }
 
 /// Reflow a paragraph's children.
-fn reflow_paragraph(children: &mut Vec<Node>, target_width: usize, prefix_width: usize) {
+fn reflow_paragraph(
+    children: &mut Vec<Node>,
+    initial_width: usize,
+    target_width: usize,
+    final_width: usize,
+    single_line_width: usize,
+    prefix_width: usize,
+    initial_line_pending: &mut bool,
+) {
     // 1. Convert all children to spans.
     let spans: Vec<Span> = children.iter().flat_map(node_to_spans).collect();
 
@@ -806,7 +1012,27 @@ fn reflow_paragraph(children: &mut Vec<Node>, target_width: usize, prefix_width:
 
     // 2. Word-wrap the spans, accounting for the prefix that rendering will add.
     let available_width = target_width.saturating_sub(prefix_width);
-    let wrapped = wrap_spans(&spans, available_width);
+    let final_available_width = final_width.saturating_sub(prefix_width);
+    let wrapped = if *initial_line_pending {
+        *initial_line_pending = false;
+        wrap_spans_with_edge_widths(
+            &spans,
+            initial_width.saturating_sub(prefix_width),
+            available_width,
+            final_available_width,
+            single_line_width.saturating_sub(prefix_width),
+        )
+    } else if final_available_width != available_width {
+        wrap_spans_with_edge_widths(
+            &spans,
+            available_width,
+            available_width,
+            final_available_width,
+            final_available_width,
+        )
+    } else {
+        wrap_spans(&spans, available_width)
+    };
 
     // 3. Merge adjacent SoftBreak + Text("\n") patterns and trim.
     let wrapped = coalesce_spans(&wrapped);
