@@ -717,6 +717,7 @@ fn reserve_final_line_width(
                 };
                 if prefix_width + trimmed_width <= target_width {
                     split_at = Some(i - 1);
+                    break;
                 }
             }
         }
@@ -1444,38 +1445,72 @@ fn render_table(table: &Table, out: &mut String) {
         return;
     }
 
-    // Determine column count from first row.
-    let col_count = rows[0].children.len();
+    let col_count = rows.iter().map(|r| r.children.len()).max().unwrap_or(0);
 
-    // Render each row.
-    for (i, row) in rows.iter().enumerate() {
-        out.push_str("| ");
-        for (j, cell) in row.children.iter().enumerate() {
-            if j > 0 {
-                out.push_str(" | ");
-            }
+    // Render every cell up front so columns can be padded to a common width.
+    let mut grid: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut cells: Vec<String> = Vec::with_capacity(col_count);
+        for cell in &row.children {
             if let Node::TableCell(tc) = cell {
-                render_phrasing(&tc.children, out);
+                let mut text = String::new();
+                render_phrasing(&tc.children, &mut text);
+                cells.push(text);
             }
         }
-        out.push_str(" |\n");
+        cells.resize(col_count, String::new());
+        grid.push(cells);
+    }
 
-        // Render alignment row after header (first row).
-        if i == 0 {
-            out.push_str("| ");
-            for j in 0..col_count {
-                if j > 0 {
-                    out.push_str(" | ");
-                }
-                let align = table.align.get(j).unwrap_or(&AlignKind::None);
-                match align {
-                    AlignKind::Left => out.push_str(":--"),
-                    AlignKind::Right => out.push_str("--:"),
-                    AlignKind::Center => out.push_str(":-:"),
-                    AlignKind::None => out.push_str("---"),
-                }
+    // Column width: the widest cell, but at least 3 so the alignment row can
+    // hold a conventional `---` marker.
+    let mut widths = vec![3usize; col_count];
+    for cells in &grid {
+        for (j, cell) in cells.iter().enumerate() {
+            widths[j] = widths[j].max(cell.chars().count());
+        }
+    }
+
+    // Render each row with cells padded to the column width, so the pipes
+    // line up vertically for human readability.
+    for (i, cells) in grid.iter().enumerate() {
+        out.push('|');
+        for (j, cell) in cells.iter().enumerate() {
+            out.push(' ');
+            out.push_str(cell);
+            for _ in 0..widths[j] - cell.chars().count() {
+                out.push(' ');
             }
-            out.push_str(" |\n");
+            out.push_str(" |");
+        }
+        out.push('\n');
+
+        // Render alignment row after header (first row), with the dashes
+        // stretched to the column width.
+        if i == 0 {
+            out.push('|');
+            for (j, &w) in widths.iter().enumerate() {
+                let align = table.align.get(j).unwrap_or(&AlignKind::None);
+                out.push(' ');
+                match align {
+                    AlignKind::Left => {
+                        out.push(':');
+                        out.push_str(&"-".repeat(w - 1));
+                    }
+                    AlignKind::Right => {
+                        out.push_str(&"-".repeat(w - 1));
+                        out.push(':');
+                    }
+                    AlignKind::Center => {
+                        out.push(':');
+                        out.push_str(&"-".repeat(w - 2));
+                        out.push(':');
+                    }
+                    AlignKind::None => out.push_str(&"-".repeat(w)),
+                }
+                out.push_str(" |");
+            }
+            out.push('\n');
         }
     }
 }
@@ -1569,6 +1604,16 @@ mod tests {
                 line.len()
             );
         }
+    }
+
+    #[test]
+    fn edge_widths_reserve_final_line_by_splitting_late() {
+        let input = "The expectation of the Gamma distribution with shape `shape` and rate `rate` is\n`shape / rate`.\n";
+        let result = reflow_with_edge_widths(input, 96, 100, 97, 93).unwrap();
+        assert_eq!(
+            result,
+            "The expectation of the Gamma distribution with shape `shape` and rate `rate` is\n`shape / rate`.\n"
+        );
     }
 
     #[test]
@@ -1833,8 +1878,51 @@ mod tests {
     fn test_table_preserved() {
         let input = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
         let result = reflow(input, 80).unwrap();
-        assert!(result.contains("| A | B |\n"), "got: {result:?}");
+        assert!(result.contains("| A   | B   |\n"), "got: {result:?}");
         assert!(result.contains("| --- | --- |\n"), "got: {result:?}");
+        assert!(result.contains("| 1   | 2   |\n"), "got: {result:?}");
+    }
+
+    #[test]
+    fn test_table_column_padding_is_preserved() {
+        // Human-readable alignment padding must survive a round trip.
+        let input = "\
+| node            | mover | Stop payoff |
+| --------------- | ----- | ----------- |
+| round 1 (root)  | 0     | `(1, 0)`    |
+| round 4 (final) | 1     | `(0, 4)`    |
+";
+        let result = reflow(input, 100).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_table_unpadded_columns_are_aligned() {
+        // A ragged table is canonicalized to padded, aligned columns.
+        let input = "| node | mover |\n| --- | --- |\n| round 1 (root) | 0 |\n";
+        let result = reflow(input, 100).unwrap();
+        assert_eq!(
+            result,
+            "\
+| node           | mover |
+| -------------- | ----- |
+| round 1 (root) | 0     |
+"
+        );
+    }
+
+    #[test]
+    fn test_table_alignment_markers_stretch_to_width() {
+        let input = "| left | right | center |\n| :-- | --: | :-: |\n| a | b | c |\n";
+        let result = reflow(input, 100).unwrap();
+        assert_eq!(
+            result,
+            "\
+| left | right | center |
+| :--- | ----: | :----: |
+| a    | b     | c      |
+"
+        );
     }
 
     #[test]
