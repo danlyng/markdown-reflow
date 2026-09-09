@@ -1,12 +1,38 @@
 use markdown::mdast::*;
 use std::fmt::Write;
 
+/// Options controlling optional reflow transformations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Turn bare URL, `www.`, and email autolink literals into markdown links
+    /// (`https://x` → `[https://x](https://x)`). Off by default: plain URLs
+    /// pass through as ordinary text.
+    pub linkify_urls: bool,
+}
+
 /// Reflow the given markdown string to the target line width.
 ///
 /// Paragraphs are reflowed; block-level structure (headings, list items,
 /// blockquotes, code blocks, etc.) is preserved.
 pub fn reflow(input: &str, target_width: usize) -> Result<String, String> {
-    reflow_with_initial_width(input, target_width, target_width)
+    reflow_with_options(input, target_width, Options::default())
+}
+
+/// Reflow the given markdown string to the target line width with explicit
+/// [`Options`].
+pub fn reflow_with_options(
+    input: &str,
+    target_width: usize,
+    options: Options,
+) -> Result<String, String> {
+    reflow_with_edge_widths(
+        input,
+        target_width,
+        target_width,
+        target_width,
+        target_width,
+        options,
+    )
 }
 
 /// Reflow the given markdown string using `initial_width` for the first
@@ -25,6 +51,7 @@ pub fn reflow_with_initial_width(
         target_width,
         target_width,
         initial_width,
+        Options::default(),
     )
 }
 
@@ -36,6 +63,7 @@ pub fn reflow_with_edge_widths(
     target_width: usize,
     final_width: usize,
     single_line_width: usize,
+    reflow_options: Options,
 ) -> Result<String, String> {
     let options = markdown::ParseOptions {
         constructs: markdown::Constructs {
@@ -43,7 +71,9 @@ pub fn reflow_with_edge_widths(
             gfm_strikethrough: true,
             gfm_footnote_definition: true,
             gfm_label_start_footnote: true,
-            gfm_autolink_literal: true,
+            // When linkification is off, bare URLs stay plain text and are
+            // rendered back verbatim.
+            gfm_autolink_literal: reflow_options.linkify_urls,
             gfm_task_list_item: true,
             ..markdown::Constructs::default()
         },
@@ -1609,7 +1639,7 @@ mod tests {
     #[test]
     fn edge_widths_reserve_final_line_by_splitting_late() {
         let input = "The expectation of the Gamma distribution with shape `shape` and rate `rate` is\n`shape / rate`.\n";
-        let result = reflow_with_edge_widths(input, 96, 100, 97, 93).unwrap();
+        let result = reflow_with_edge_widths(input, 96, 100, 97, 93, Options::default()).unwrap();
         assert_eq!(
             result,
             "The expectation of the Gamma distribution with shape `shape` and rate `rate` is\n`shape / rate`.\n"
@@ -1872,6 +1902,29 @@ mod tests {
         let input = "Text with footnote[^1].\n\n[^1]: The footnote.\n";
         let result = reflow(input, 80).unwrap();
         assert!(result.contains("[^1]"), "footnote ref lost: {result:?}");
+    }
+
+    #[test]
+    fn test_bare_url_left_alone_by_default() {
+        let input = "See https://example.com/docs for details.\n";
+        assert_eq!(reflow(input, 80).unwrap(), input);
+    }
+
+    #[test]
+    fn test_bare_url_linkified_with_option() {
+        let input = "See https://example.com/docs for details.\n";
+        let result = reflow_with_options(input, 80, Options { linkify_urls: true }).unwrap();
+        assert_eq!(
+            result,
+            "See [https://example.com/docs](https://example.com/docs) for details.\n"
+        );
+    }
+
+    #[test]
+    fn test_explicit_link_kept_without_linkify() {
+        // Only bare URLs are affected — explicit links always stay links.
+        let input = "See [the docs](https://example.com) for more.\n";
+        assert_eq!(reflow(input, 80).unwrap(), input);
     }
 
     #[test]
