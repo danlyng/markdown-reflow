@@ -28,6 +28,9 @@ fn main() {
             eprintln!(
                 "  markdown-reflow [width] <file> <start> <end>  — reflow line range in-place"
             );
+            eprintln!();
+            eprintln!("  width defaults to {DEFAULT_WIDTH}; positive values wrap at that width,");
+            eprintln!("  and zero or negative values disable width-based wrapping.");
             process::exit(1);
         }
     }
@@ -35,10 +38,10 @@ fn main() {
 
 enum Mode {
     /// Read from stdin, write to stdout.
-    Pipe { width: usize },
+    Pipe { width: Option<usize> },
     /// Edit a file in-place: reflow lines `start..=end` (1-indexed, inclusive).
     Replace {
-        width: usize,
+        width: Option<usize>,
         path: PathBuf,
         start: usize,
         end: usize,
@@ -50,15 +53,21 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
 
     if args.is_empty() {
         return Ok(Mode::Pipe {
-            width: DEFAULT_WIDTH,
+            width: Some(DEFAULT_WIDTH),
         });
     }
 
     // First positional arg may be a width (integer) or a file path.
     let (width, rest) = if let Ok(w) = args[0].parse::<usize>() {
-        (w, &args[1..])
+        ((w > 0).then_some(w), &args[1..])
+    } else if args[0]
+        .strip_prefix('-')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    {
+        // Only the sign matters for negative widths, so avoid integer range limits.
+        (None, &args[1..])
     } else {
-        (DEFAULT_WIDTH, args)
+        (Some(DEFAULT_WIDTH), args)
     };
 
     if rest.is_empty() {
@@ -102,7 +111,7 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
 // Pipe mode: stdin → stdout
 // ---------------------------------------------------------------------------
 
-fn run_pipe(width: usize) {
+fn run_pipe(width: Option<usize>) {
     let mut input = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut input) {
         eprintln!("error reading stdin: {e}");
@@ -122,7 +131,7 @@ fn run_pipe(width: usize) {
 // Replace mode: in-place line-range editing
 // ---------------------------------------------------------------------------
 
-fn run_replace(width: usize, path: PathBuf, start: usize, end: usize) {
+fn run_replace(width: Option<usize>, path: PathBuf, start: usize, end: usize) {
     // Read the file.
     let original = match fs::read_to_string(&path) {
         Ok(s) => s,
@@ -186,5 +195,81 @@ fn run_replace(width: usize, path: PathBuf, start: usize, end: usize) {
     if let Err(e) = fs::write(&path, &result) {
         eprintln!("error writing {}: {e}", path.display());
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn width_cases() -> Vec<(Option<String>, Option<usize>)> {
+        vec![
+            (None, Some(100)),
+            (Some("80".into()), Some(80)),
+            (Some("1".into()), Some(1)),
+            (Some("+80".into()), Some(80)),
+            (Some(usize::MAX.to_string()), Some(usize::MAX)),
+            (Some("0".into()), None),
+            (Some("+0".into()), None),
+            (Some("-0".into()), None),
+            (Some("-1".into()), None),
+            (Some("-100".into()), None),
+            (
+                Some("-9999999999999999999999999999999999999999".into()),
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn pipe_widths() {
+        for (arg, expected) in width_cases() {
+            let mut args = vec!["markdown-reflow".into()];
+            args.extend(arg);
+            match parse_args(&args).unwrap() {
+                Mode::Pipe { width } => assert_eq!(width, expected, "args: {args:?}"),
+                Mode::Replace { .. } => panic!("expected pipe mode for {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn replace_widths() {
+        for (arg, expected) in width_cases() {
+            let mut args = vec!["markdown-reflow".into()];
+            args.extend(arg);
+            args.extend(["document.md".into(), "2".into(), "5".into()]);
+            match parse_args(&args).unwrap() {
+                Mode::Replace {
+                    width,
+                    path,
+                    start,
+                    end,
+                } => {
+                    assert_eq!(width, expected, "args: {args:?}");
+                    assert_eq!(path, PathBuf::from("document.md"));
+                    assert_eq!((start, end), (2, 5));
+                }
+                Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn non_numeric_negative_prefix_is_a_path() {
+        for path in ["-", "-notes.md", "-1.md", "--1", "-+1"] {
+            let args = ["markdown-reflow", path, "1", "2"].map(String::from);
+            match parse_args(&args).unwrap() {
+                Mode::Replace {
+                    width,
+                    path: actual,
+                    ..
+                } => {
+                    assert_eq!(width, Some(100));
+                    assert_eq!(actual, PathBuf::from(path));
+                }
+                Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
+            }
+        }
     }
 }
