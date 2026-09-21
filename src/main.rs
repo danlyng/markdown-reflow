@@ -24,13 +24,16 @@ fn main() {
             eprintln!("error: {e}");
             eprintln!();
             eprintln!("usage:");
-            eprintln!("  markdown-reflow [width]                  — reflow stdin → stdout");
+            eprintln!("  markdown-reflow [width]                      — reflow stdin → stdout");
             eprintln!(
-                "  markdown-reflow [width] <file> <start> <end>  — reflow line range in-place"
+                "  markdown-reflow [width] <file> [start] [end] — reflow line range in-place"
             );
             eprintln!();
             eprintln!("  width defaults to {DEFAULT_WIDTH}; positive values wrap at that width,");
             eprintln!("  and zero or negative values disable width-based wrapping.");
+            eprintln!("  line numbers are 1-indexed and inclusive; negative values count from");
+            eprintln!("  the end of the file (-1 = last line). start defaults to 1 and end to");
+            eprintln!("  the last line, so `<file>` alone reflows the whole file.");
             process::exit(1);
         }
     }
@@ -40,11 +43,13 @@ enum Mode {
     /// Read from stdin, write to stdout.
     Pipe { width: Option<usize> },
     /// Edit a file in-place: reflow lines `start..=end` (1-indexed, inclusive).
+    /// Missing bounds default to the whole file; negative indices count from
+    /// the end (-1 = last line).
     Replace {
         width: Option<usize>,
         path: PathBuf,
-        start: usize,
-        end: usize,
+        start: Option<isize>,
+        end: Option<isize>,
     },
 }
 
@@ -74,37 +79,45 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
         return Ok(Mode::Pipe { width });
     }
 
-    // If we have a file path and two line numbers, it's replace mode.
-    if rest.len() >= 3 {
-        let path = PathBuf::from(&rest[0]);
-        let start: usize = rest[1]
-            .parse()
-            .map_err(|_| format!("invalid start line: {}", rest[1]))?;
-        let end: usize = rest[2]
-            .parse()
-            .map_err(|_| format!("invalid end line: {}", rest[2]))?;
-
-        if start < 1 || end < start {
+    // A file path plus up to two line numbers is replace mode; omitted line
+    // numbers default to the first and last line respectively.
+    let line_args = &rest[1..];
+    let (start, end) = match line_args.len() {
+        0 => (None, None),
+        1 => (Some(parse_line_arg(&line_args[0], "start")?), None),
+        2 => (
+            Some(parse_line_arg(&line_args[0], "start")?),
+            Some(parse_line_arg(&line_args[1], "end")?),
+        ),
+        _ => {
             return Err(format!(
-                "invalid line range: start={start}, end={end} (must be 1 ≤ start ≤ end)"
+                "unexpected arguments: {}",
+                rest.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ));
         }
+    };
 
-        return Ok(Mode::Replace {
-            width,
-            path,
-            start,
-            end,
-        });
+    Ok(Mode::Replace {
+        width,
+        path: PathBuf::from(&rest[0]),
+        start,
+        end,
+    })
+}
+
+/// Parse a line-number argument: positive values are 1-indexed from the start
+/// of the file, negative values count from the end, and zero is invalid.
+fn parse_line_arg(arg: &str, which: &str) -> Result<isize, String> {
+    let n: isize = arg
+        .parse()
+        .map_err(|_| format!("invalid {which} line: {arg}"))?;
+    if n == 0 {
+        return Err(format!("invalid {which} line: {arg} (must be nonzero)"));
     }
-
-    Err(format!(
-        "unexpected arguments: {}",
-        rest.iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-    ))
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +144,7 @@ fn run_pipe(width: Option<usize>) {
 // Replace mode: in-place line-range editing
 // ---------------------------------------------------------------------------
 
-fn run_replace(width: Option<usize>, path: PathBuf, start: usize, end: usize) {
+fn run_replace(width: Option<usize>, path: PathBuf, start: Option<isize>, end: Option<isize>) {
     // Read the file.
     let original = match fs::read_to_string(&path) {
         Ok(s) => s,
@@ -144,7 +157,30 @@ fn run_replace(width: Option<usize>, path: PathBuf, start: usize, end: usize) {
     // Extract the line range (1-indexed, inclusive).
     let lines: Vec<&str> = original.lines().collect();
     let total_lines = lines.len();
+    if total_lines == 0 {
+        return; // no lines to reflow
+    }
 
+    // Missing bounds default to the whole file: line 1 through the last line.
+    let start = match resolve_line("start", start.unwrap_or(1), total_lines) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    let end = match resolve_line("end", end.unwrap_or(-1), total_lines) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+
+    if start > end {
+        eprintln!("error: invalid line range: start={start}, end={end} (must be 1 ≤ start ≤ end)");
+        process::exit(1);
+    }
     if start > total_lines {
         eprintln!("error: start line {start} exceeds file length ({total_lines} lines)");
         process::exit(1);
@@ -198,6 +234,24 @@ fn run_replace(width: Option<usize>, path: PathBuf, start: usize, end: usize) {
     }
 }
 
+/// Resolve a parsed line number against the file length: positive values are
+/// 1-indexed from the start, negative values count from the end (-1 = last
+/// line). Fails if the index points before line 1; callers clamp an end that
+/// runs past the last line.
+fn resolve_line(which: &str, n: isize, total_lines: usize) -> Result<usize, String> {
+    let resolved = if n > 0 {
+        n
+    } else {
+        total_lines as isize + n + 1
+    };
+    if resolved < 1 {
+        return Err(format!(
+            "{which} line {n} is out of range (file has {total_lines} lines)"
+        ));
+    }
+    Ok(resolved as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,7 +302,7 @@ mod tests {
                 } => {
                     assert_eq!(width, expected, "args: {args:?}");
                     assert_eq!(path, PathBuf::from("document.md"));
-                    assert_eq!((start, end), (2, 5));
+                    assert_eq!((start, end), (Some(2), Some(5)));
                 }
                 Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
             }
@@ -271,5 +325,104 @@ mod tests {
                 Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
             }
         }
+    }
+
+    #[test]
+    fn replace_without_line_numbers_defaults_to_whole_file() {
+        let args = ["markdown-reflow", "document.md"].map(String::from);
+        match parse_args(&args).unwrap() {
+            Mode::Replace {
+                width, start, end, ..
+            } => {
+                assert_eq!(width, Some(DEFAULT_WIDTH));
+                assert_eq!((start, end), (None, None));
+            }
+            Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_ranges_with_negative_indices() {
+        for (line_args, expected) in [
+            (vec!["3"], (Some(3), None)),
+            (vec!["-3"], (Some(-3), None)),
+            (vec!["1", "-1"], (Some(1), Some(-1))),
+            (vec!["-2", "-1"], (Some(-2), Some(-1))),
+            (vec!["-1", "5"], (Some(-1), Some(5))),
+        ] {
+            let mut args = vec!["markdown-reflow".to_string(), "document.md".to_string()];
+            args.extend(line_args.iter().map(|s| s.to_string()));
+            match parse_args(&args).unwrap() {
+                Mode::Replace { start, end, .. } => {
+                    assert_eq!((start, end), expected, "args: {args:?}")
+                }
+                Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn zero_line_numbers_are_rejected() {
+        for line_args in [
+            vec!["0"],
+            vec!["0", "5"],
+            vec!["5", "0"],
+            vec!["-0", "1"],
+            vec!["+0", "1"],
+        ] {
+            let mut args = vec!["markdown-reflow".to_string(), "document.md".to_string()];
+            args.extend(line_args.iter().map(|s| s.to_string()));
+            assert!(parse_args(&args).is_err(), "expected error for {args:?}");
+        }
+    }
+
+    #[test]
+    fn too_many_line_numbers_are_rejected() {
+        let args = ["markdown-reflow", "document.md", "1", "2", "3"].map(String::from);
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn resolving_line_numbers() {
+        // Positive values are 1-indexed from the start.
+        assert_eq!(resolve_line("start", 1, 10).unwrap(), 1);
+        assert_eq!(resolve_line("end", 7, 10).unwrap(), 7);
+        // Negative values count from the end (-1 = last line).
+        assert_eq!(resolve_line("end", -1, 10).unwrap(), 10);
+        assert_eq!(resolve_line("start", -10, 10).unwrap(), 1);
+        // Indices pointing before the first line are errors.
+        assert!(resolve_line("start", -11, 10).is_err());
+        assert!(resolve_line("end", -20, 10).is_err());
+    }
+
+    #[test]
+    fn replace_whole_file_by_default() {
+        let dir = env::temp_dir().join(format!("markdown-reflow-test-whole-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.md");
+        let original = "one two three\n\nfour five\n";
+        fs::write(&path, original).unwrap();
+
+        run_replace(Some(5), path.clone(), None, None);
+
+        // Defaulting to 1..=max must be equivalent to reflowing every line.
+        let body = original.strip_suffix('\n').unwrap();
+        let expected = reflow::reflow(body, Some(5)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_negative_line_range() {
+        let dir = env::temp_dir().join(format!("markdown-reflow-test-neg-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.md");
+        // Three lines; -1 selects just the last one.
+        fs::write(&path, "aaa bbb\n\nccc ddd\n").unwrap();
+
+        run_replace(Some(3), path.clone(), Some(-1), None);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "aaa bbb\n\nccc\nddd\n");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
