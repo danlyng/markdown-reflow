@@ -1,4 +1,4 @@
-use markdown_reflow::reflow;
+use markdown_reflow::{EdgeWidths, Options, reflow};
 
 use std::env;
 use std::fs;
@@ -13,13 +13,13 @@ fn main() {
 
     // Determine mode and parse arguments.
     match parse_args(&args) {
-        Ok(Mode::Pipe { width }) => run_pipe(width),
+        Ok(Mode::Pipe { width }) => run_pipe(options_for_width(width)),
         Ok(Mode::Replace {
             width,
             path,
             start,
             end,
-        }) => run_replace(width, path, start, end),
+        }) => run_replace(options_for_width(width), path, start, end),
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!();
@@ -36,6 +36,19 @@ fn main() {
             eprintln!("  the last line, so `<file>` alone reflows the whole file.");
             process::exit(1);
         }
+    }
+}
+
+/// Translate the CLI's uniform width into the library configuration.
+fn options_for_width(width: Option<usize>) -> Options {
+    Options {
+        widths: EdgeWidths {
+            first: width,
+            middle: width,
+            last: width,
+            single: width,
+        },
+        ..Options::default()
     }
 }
 
@@ -124,14 +137,14 @@ fn parse_line_arg(arg: &str, which: &str) -> Result<isize, String> {
 // Pipe mode: stdin → stdout
 // ---------------------------------------------------------------------------
 
-fn run_pipe(width: Option<usize>) {
+fn run_pipe(options: Options) {
     let mut input = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut input) {
         eprintln!("error reading stdin: {e}");
         process::exit(1);
     }
 
-    match reflow::reflow(&input, width) {
+    match reflow(&input, options) {
         Ok(output) => print!("{output}"),
         Err(e) => {
             eprintln!("error: {e}");
@@ -144,7 +157,7 @@ fn run_pipe(width: Option<usize>) {
 // Replace mode: in-place line-range editing
 // ---------------------------------------------------------------------------
 
-fn run_replace(width: Option<usize>, path: PathBuf, start: Option<isize>, end: Option<isize>) {
+fn run_replace(options: Options, path: PathBuf, start: Option<isize>, end: Option<isize>) {
     // Read the file.
     let original = match fs::read_to_string(&path) {
         Ok(s) => s,
@@ -191,7 +204,7 @@ fn run_replace(width: Option<usize>, path: PathBuf, start: Option<isize>, end: O
     let input_txt = lines[start - 1..actual_end].join("\n");
 
     // Reflow.
-    let output_txt = match reflow::reflow(&input_txt, width) {
+    let output_txt = match reflow(&input_txt, options) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -403,11 +416,11 @@ mod tests {
         let original = "one two three\n\nfour five\n";
         fs::write(&path, original).unwrap();
 
-        run_replace(Some(5), path.clone(), None, None);
+        run_replace(options_for_width(Some(5)), path.clone(), None, None);
 
         // Defaulting to 1..=max must be equivalent to reflowing every line.
         let body = original.strip_suffix('\n').unwrap();
-        let expected = reflow::reflow(body, Some(5)).unwrap();
+        let expected = reflow(body, options_for_width(Some(5))).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -420,7 +433,7 @@ mod tests {
         // Three lines; -1 selects just the last one.
         fs::write(&path, "aaa bbb\n\nccc ddd\n").unwrap();
 
-        run_replace(Some(3), path.clone(), Some(-1), None);
+        run_replace(options_for_width(Some(3)), path.clone(), Some(-1), None);
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "aaa bbb\n\nccc\nddd\n");
         fs::remove_dir_all(&dir).unwrap();
