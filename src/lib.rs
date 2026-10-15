@@ -1,21 +1,56 @@
 use markdown::mdast::*;
 use std::fmt::Write;
 
+/// Whether to wrap, join soft breaks, or leave existing line breaks alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReflowWidth {
+    /// Wrap at this many characters. Zero is a literal zero-width budget;
+    /// indivisible content such as a word can still exceed the budget.
+    Finite(usize),
+    /// Join existing soft breaks without inserting new ones.
+    #[default]
+    Infinite,
+    /// Skip reflow while still applying parsing and rendering transformations.
+    Disabled,
+}
+
+impl ReflowWidth {
+    fn saturating_sub(self, prefix_width: usize) -> Self {
+        match self {
+            Self::Finite(width) => Self::Finite(width.saturating_sub(prefix_width)),
+            other => other,
+        }
+    }
+
+    fn is_exceeded_by(self, width: usize) -> bool {
+        matches!(self, Self::Finite(limit) if width > limit)
+    }
+}
+
 /// Available content widths for each position in the rendered output.
 ///
-/// Each `None` leaves that width unconstrained. When `middle` is `None`,
-/// wrapping is disabled entirely and the other budgets are ignored.
-/// Widths count visible characters, excluding prefixes supplied by the caller.
+/// `Infinite` leaves a width unconstrained. An infinite `middle` joins soft
+/// breaks without wrapping and ignores the other budgets. Setting any budget
+/// to `Disabled` skips reflow for the entire document, preserving soft breaks.
+/// Other parsing and rendering transformations still apply in all modes.
+/// Widths count characters, including Markdown delimiters but excluding
+/// prefixes supplied by the caller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EdgeWidths {
     /// Budget for the first rendered content line.
-    pub first: Option<usize>,
-    /// Budget for continuation lines; `None` disables wrapping.
-    pub middle: Option<usize>,
+    pub first: ReflowWidth,
+    /// Budget for continuation lines; `Infinite` disables width-based wrapping.
+    pub middle: ReflowWidth,
     /// Budget for the last rendered content line.
-    pub last: Option<usize>,
+    pub last: ReflowWidth,
     /// Budget when the content occupies a single rendered line.
-    pub single: Option<usize>,
+    pub single: ReflowWidth,
+}
+
+impl EdgeWidths {
+    fn reflow_disabled(self) -> bool {
+        [self.first, self.middle, self.last, self.single].contains(&ReflowWidth::Disabled)
+    }
 }
 
 /// Reflow configuration. Defaults to unlimited width and no linkification.
@@ -32,16 +67,18 @@ pub struct Options {
 /// Paragraphs are reflowed while block structure and explicit hard breaks are
 /// preserved. With the default options, existing soft breaks are joined without
 /// inserting new ones. To wrap uniformly, set all four width budgets alike.
+/// Set any budget to `ReflowWidth::Disabled` to skip reflow while retaining
+/// other transformations, such as linkification and table formatting.
 ///
 /// ```
-/// use markdown_reflow::{reflow, EdgeWidths, Options};
+/// use markdown_reflow::{reflow, EdgeWidths, Options, ReflowWidth};
 ///
 /// let options = Options {
 ///     widths: EdgeWidths {
-///         first: Some(10),
-///         middle: Some(10),
-///         last: Some(10),
-///         single: Some(10),
+///         first: ReflowWidth::Finite(10),
+///         middle: ReflowWidth::Finite(10),
+///         last: ReflowWidth::Finite(10),
+///         single: ReflowWidth::Finite(10),
 ///     },
 ///     ..Options::default()
 /// };
@@ -565,18 +602,10 @@ fn tokenize_span(span: &Span, out: &mut Vec<WrapToken>) {
 
 /// Insert soft breaks at word boundaries within the supplied content budgets.
 fn wrap_spans(spans: &[Span], widths: EdgeWidths) -> Vec<Span> {
-    if widths.middle.is_none() {
+    if widths.middle == ReflowWidth::Infinite {
         let mut tokens = Vec::new();
         tokenize(spans, &mut tokens);
         return tokens_to_spans(&tokens);
-    }
-
-    if widths.first == Some(0)
-        || widths.middle == Some(0)
-        || widths.last == Some(0)
-        || widths.single == Some(0)
-    {
-        return spans.to_vec();
     }
 
     // 1. Tokenize: flatten compound spans into open/close markers.
@@ -618,7 +647,7 @@ fn wrap_spans(spans: &[Span], widths: EdgeWidths) -> Vec<Span> {
 
         let w = tok.width();
 
-        if current_target_width.is_some_and(|limit| line_width + w > limit) && line_width > 0 {
+        if current_target_width.is_exceeded_by(line_width + w) && line_width > 0 {
             // Need to break.  Search backwards for a break opportunity.
             let mut found = false;
             for j in (0..result_tokens.len()).rev() {
@@ -679,7 +708,7 @@ fn reserve_final_line_width(tokens: &mut Vec<WrapToken>, widths: EdgeWidths) {
         } else {
             widths.last
         };
-        let Some(limit) = limit else {
+        let ReflowWidth::Finite(limit) = limit else {
             return;
         };
         let line_width: usize = tokens[line_start..].iter().map(WrapToken::width).sum();
@@ -701,10 +730,7 @@ fn reserve_final_line_width(tokens: &mut Vec<WrapToken>, widths: EdgeWidths) {
                     WrapToken::Word(s) => s.trim_end().chars().count(),
                     tok => tok.width(),
                 };
-                if widths
-                    .middle
-                    .is_none_or(|limit| prefix_width + trimmed_width <= limit)
-                {
+                if !widths.middle.is_exceeded_by(prefix_width + trimmed_width) {
                     split_at = Some(i - 1);
                     break;
                 }
@@ -851,6 +877,9 @@ fn tokens_to_spans(tokens: &[WrapToken]) -> Vec<Span> {
 // ---------------------------------------------------------------------------
 
 fn reflow_root(root: &mut Node, widths: EdgeWidths) {
+    if widths.reflow_disabled() {
+        return;
+    }
     if let Some(children) = root.children_mut() {
         let mut initial_line_pending = widths.first != widths.middle
             || widths.last != widths.middle
@@ -944,14 +973,10 @@ fn reflow_paragraph(
 
     // Account for the prefix that rendering adds to each line.
     let mut available = EdgeWidths {
-        first: widths.first.map(|width| width.saturating_sub(prefix_width)),
-        middle: widths
-            .middle
-            .map(|width| width.saturating_sub(prefix_width)),
-        last: widths.last.map(|width| width.saturating_sub(prefix_width)),
-        single: widths
-            .single
-            .map(|width| width.saturating_sub(prefix_width)),
+        first: widths.first.saturating_sub(prefix_width),
+        middle: widths.middle.saturating_sub(prefix_width),
+        last: widths.last.saturating_sub(prefix_width),
+        single: widths.single.saturating_sub(prefix_width),
     };
     if *initial_line_pending {
         *initial_line_pending = false;
@@ -1521,10 +1546,10 @@ mod tests {
     fn uniform_options(width: usize) -> Options {
         Options {
             widths: EdgeWidths {
-                first: Some(width),
-                middle: Some(width),
-                last: Some(width),
-                single: Some(width),
+                first: ReflowWidth::Finite(width),
+                middle: ReflowWidth::Finite(width),
+                last: ReflowWidth::Finite(width),
+                single: ReflowWidth::Finite(width),
             },
             ..Options::default()
         }
@@ -1540,8 +1565,8 @@ mod tests {
                 input,
                 Options {
                     widths: EdgeWidths {
-                        first: Some(1),
-                        single: Some(1),
+                        first: ReflowWidth::Finite(1),
+                        single: ReflowWidth::Finite(1),
                         ..EdgeWidths::default()
                     },
                     ..Options::default()
@@ -1555,9 +1580,9 @@ mod tests {
                 input,
                 Options {
                     widths: EdgeWidths {
-                        first: Some(1),
-                        last: Some(1),
-                        single: Some(1),
+                        first: ReflowWidth::Finite(1),
+                        last: ReflowWidth::Finite(1),
+                        single: ReflowWidth::Finite(1),
                         ..EdgeWidths::default()
                     },
                     ..Options::default()
@@ -1600,6 +1625,102 @@ mod tests {
     }
 
     #[test]
+    fn finite_infinite_and_disabled_have_distinct_behavior() {
+        let input = "one two\nthree four\n";
+        assert_eq!(
+            reflow(input, uniform_options(5)).unwrap(),
+            "one\ntwo\nthree\nfour\n"
+        );
+        assert_eq!(
+            reflow(input, Options::default()).unwrap(),
+            "one two three four\n"
+        );
+        assert_eq!(
+            reflow(
+                input,
+                Options {
+                    widths: EdgeWidths {
+                        middle: ReflowWidth::Disabled,
+                        ..EdgeWidths::default()
+                    },
+                    ..Options::default()
+                }
+            )
+            .unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn disabled_width_preserves_nested_soft_breaks_and_hard_breaks() {
+        let input = "First **bold\ntext** and [a\nlink](https://example.com).  \nHard\nbreak.\n\n> * Nested\n>   item.\n\n```text\ncode\nlines\n```\n";
+        let expected = "First **bold\ntext** and [a\nlink](https://example.com).\\\nHard\nbreak.\n\n> * Nested\n>   item.\n\n```text\ncode\nlines\n```\n";
+        // Any disabled budget bypasses the whole reflow traversal, even when
+        // the other budgets would wrap aggressively or join soft breaks.
+        for remaining in [
+            ReflowWidth::Finite(1),
+            ReflowWidth::Infinite,
+            ReflowWidth::Disabled,
+        ] {
+            for disabled_edge in 0..4 {
+                let mut widths = [remaining; 4];
+                widths[disabled_edge] = ReflowWidth::Disabled;
+                let [first, middle, last, single] = widths;
+                assert_eq!(
+                    reflow(
+                        input,
+                        Options {
+                            widths: EdgeWidths {
+                                first,
+                                middle,
+                                last,
+                                single
+                            },
+                            ..Options::default()
+                        }
+                    )
+                    .unwrap(),
+                    expected,
+                    "remaining: {remaining:?}, disabled edge: {disabled_edge}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_width_still_linkifies_and_formats_markdown() {
+        let input = "Heading\n=======\n\nSee\nhttps://example.com\nwww.example.com\nperson@example.com\nnow.\n\n|a|long|\n|-|-|\n|b|c|\n";
+        let expected = "# Heading\n\nSee\n[https://example.com](https://example.com)\n[www.example.com](http://www.example.com)\n[person@example.com](mailto:person@example.com)\nnow.\n\n| a   | long |\n| --- | ---- |\n| b   | c    |\n";
+        assert_eq!(
+            reflow(
+                input,
+                Options {
+                    widths: EdgeWidths {
+                        middle: ReflowWidth::Disabled,
+                        ..EdgeWidths::default()
+                    },
+                    linkify_urls: true,
+                }
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn finite_zero_is_a_budget_and_does_not_disable_reflow() {
+        assert_eq!(
+            reflow("one two\nthree\n", uniform_options(0)).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        // Prefix subtraction may also produce a zero-width content budget.
+        assert_eq!(
+            reflow("* one two\n", uniform_options(1)).unwrap(),
+            "* one\n  two\n"
+        );
+    }
+
+    #[test]
     fn test_simple_paragraph_reflow() {
         let input = "This is a paragraph that needs to be reflowed to a narrower width.\n";
         let result = reflow(input, uniform_options(40)).unwrap();
@@ -1620,10 +1741,10 @@ mod tests {
             input,
             Options {
                 widths: EdgeWidths {
-                    first: Some(96),
-                    middle: Some(100),
-                    last: Some(97),
-                    single: Some(93),
+                    first: ReflowWidth::Finite(96),
+                    middle: ReflowWidth::Finite(100),
+                    last: ReflowWidth::Finite(97),
+                    single: ReflowWidth::Finite(93),
                 },
                 ..Options::default()
             },

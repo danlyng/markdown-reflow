@@ -1,46 +1,56 @@
 # markdown-reflow
 
-Reflow Markdown paragraphs while preserving block structure, inline formatting,
-and explicit hard breaks. Available as a Rust library and a command-line tool.
+Reflow Markdown paragraphs while preserving block structure, inline formatting, and explicit hard breaks. Available as a Rust library and a command-line tool.
 
 ## Library
 
-The public API consists of `reflow`, `Options`, and `EdgeWidths`, exported from
-the crate root:
+The public API consists of `reflow`, `Options`, `EdgeWidths`, and `ReflowWidth`, exported from the crate root:
 
 ```rust
-use markdown_reflow::{reflow, EdgeWidths, Options};
+use markdown_reflow::{reflow, EdgeWidths, Options, ReflowWidth};
 
 let options = Options {
     widths: EdgeWidths {
-        first: Some(80),
-        middle: Some(80),
-        last: Some(80),
-        single: Some(80),
+        first: ReflowWidth::Finite(80),
+        middle: ReflowWidth::Finite(80),
+        last: ReflowWidth::Finite(80),
+        single: ReflowWidth::Finite(80),
     },
     linkify_urls: false,
 };
 let output = reflow("Some Markdown to reflow.", options)?;
 ```
 
-Set all four budgets alike for uniform wrapping. Set different budgets to reserve
-space for external prefixes and suffixes, such as comment delimiters:
+Set all four budgets alike for uniform wrapping. Set different budgets to reserve space for external prefixes and suffixes, such as comment delimiters:
 
 - `first`: first content line.
 - `middle`: continuation lines.
 - `last`: last content line.
 - `single`: content that occupies just one line.
 
-Each `None` leaves that width unconstrained. When `middle` is `None`, wrapping
-is disabled entirely and the other budgets are ignored. `Options::default()`
-joins existing soft breaks without inserting new ones and leaves linkification
-disabled. Explicit hard breaks remain intact.
+`ReflowWidth` makes the three behaviors explicit:
 
-`linkify_urls: true` converts bare URL, `www.`, and email autolink literals into
-Markdown links. The return type is `Result<String, String>`.
+- `Finite(usize)`: wrap at the given width. Zero is a literal zero-width budget; indivisible content such as a word can still exceed it.
+- `Infinite`: join existing soft breaks without inserting new ones. An infinite `middle` ignores the other budgets.
+- `Disabled`: skip reflow, preserving existing paragraph soft breaks while still applying other transformations. Setting any of the four budgets to `Disabled` disables reflow for the entire document.
 
-Version 0.4 replaces the width-taking reflow functions with this single entry
-point. Move width arguments into `Options.widths`; the CLI syntax is unchanged.
+`Options::default()` uses `Infinite` for all budgets and leaves linkification disabled. Explicit hard breaks remain intact in every mode.
+
+For example, linkify without reflowing:
+
+```rust
+let output = reflow(input, Options {
+    widths: EdgeWidths {
+        middle: ReflowWidth::Disabled,
+        ..EdgeWidths::default()
+    },
+    linkify_urls: true,
+})?;
+```
+
+`linkify_urls: true` converts bare URL, `www.`, and email autolink literals into Markdown links. Table formatting and Markdown syntax normalization also still apply when reflow is disabled; this mode does not preserve source formatting byte for byte. The return type is `Result<String, String>`.
+
+Version 0.5 replaces the `Option<usize>` fields in `EdgeWidths` with `ReflowWidth`. Replace `Some(width)` with `ReflowWidth::Finite(width)` and `None` with `ReflowWidth::Infinite`; use `ReflowWidth::Disabled` to skip reflow. The CLI now also defaults to `Infinite` when width is omitted; zero and negative widths still select `Infinite`.
 
 ## CLI
 
@@ -50,9 +60,7 @@ markdown-reflow [width]                         # stdin to stdout
 markdown-reflow [width] <file> [start] [end]     # replace a line range in place
 ```
 
-Width defaults to 100. Zero and negative widths disable wrapping. Line numbers
-are one-indexed and inclusive; negative indices count from the end (`-1` is the
-last line). Omitted bounds select the entire file.
+Width defaults to `Infinite`, matching the Rust API: existing soft breaks are joined without inserting new ones. Positive widths enable wrapping; zero and negative widths also select `Infinite`. Line numbers are one-indexed and inclusive; negative indices count from the end (`-1` is the last line). Omitted bounds select the entire file.
 
 ## Development
 

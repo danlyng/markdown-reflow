@@ -1,12 +1,10 @@
-use markdown_reflow::{EdgeWidths, Options, reflow};
+use markdown_reflow::{EdgeWidths, Options, ReflowWidth, reflow};
 
 use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process;
-
-const DEFAULT_WIDTH: usize = 100;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -29,8 +27,10 @@ fn main() {
                 "  markdown-reflow [width] <file> [start] [end] — reflow line range in-place"
             );
             eprintln!();
-            eprintln!("  width defaults to {DEFAULT_WIDTH}; positive values wrap at that width,");
-            eprintln!("  and zero or negative values disable width-based wrapping.");
+            eprintln!("  width defaults to infinite (join soft breaks without wrapping).");
+            eprintln!(
+                "  positive values wrap at that width; zero or negative values use infinite."
+            );
             eprintln!("  line numbers are 1-indexed and inclusive; negative values count from");
             eprintln!("  the end of the file (-1 = last line). start defaults to 1 and end to");
             eprintln!("  the last line, so `<file>` alone reflows the whole file.");
@@ -40,7 +40,7 @@ fn main() {
 }
 
 /// Translate the CLI's uniform width into the library configuration.
-fn options_for_width(width: Option<usize>) -> Options {
+fn options_for_width(width: ReflowWidth) -> Options {
     Options {
         widths: EdgeWidths {
             first: width,
@@ -54,12 +54,12 @@ fn options_for_width(width: Option<usize>) -> Options {
 
 enum Mode {
     /// Read from stdin, write to stdout.
-    Pipe { width: Option<usize> },
+    Pipe { width: ReflowWidth },
     /// Edit a file in-place: reflow lines `start..=end` (1-indexed, inclusive).
     /// Missing bounds default to the whole file; negative indices count from
     /// the end (-1 = last line).
     Replace {
-        width: Option<usize>,
+        width: ReflowWidth,
         path: PathBuf,
         start: Option<isize>,
         end: Option<isize>,
@@ -71,21 +71,28 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
 
     if args.is_empty() {
         return Ok(Mode::Pipe {
-            width: Some(DEFAULT_WIDTH),
+            width: ReflowWidth::default(),
         });
     }
 
     // First positional arg may be a width (integer) or a file path.
     let (width, rest) = if let Ok(w) = args[0].parse::<usize>() {
-        ((w > 0).then_some(w), &args[1..])
+        (
+            if w == 0 {
+                ReflowWidth::Infinite
+            } else {
+                ReflowWidth::Finite(w)
+            },
+            &args[1..],
+        )
     } else if args[0]
         .strip_prefix('-')
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
     {
         // Only the sign matters for negative widths, so avoid integer range limits.
-        (None, &args[1..])
+        (ReflowWidth::Infinite, &args[1..])
     } else {
-        (Some(DEFAULT_WIDTH), args)
+        (ReflowWidth::default(), args)
     };
 
     if rest.is_empty() {
@@ -269,21 +276,24 @@ fn resolve_line(which: &str, n: isize, total_lines: usize) -> Result<usize, Stri
 mod tests {
     use super::*;
 
-    fn width_cases() -> Vec<(Option<String>, Option<usize>)> {
+    fn width_cases() -> Vec<(Option<String>, ReflowWidth)> {
         vec![
-            (None, Some(100)),
-            (Some("80".into()), Some(80)),
-            (Some("1".into()), Some(1)),
-            (Some("+80".into()), Some(80)),
-            (Some(usize::MAX.to_string()), Some(usize::MAX)),
-            (Some("0".into()), None),
-            (Some("+0".into()), None),
-            (Some("-0".into()), None),
-            (Some("-1".into()), None),
-            (Some("-100".into()), None),
+            (None, ReflowWidth::Infinite),
+            (Some("80".into()), ReflowWidth::Finite(80)),
+            (Some("1".into()), ReflowWidth::Finite(1)),
+            (Some("+80".into()), ReflowWidth::Finite(80)),
+            (
+                Some(usize::MAX.to_string()),
+                ReflowWidth::Finite(usize::MAX),
+            ),
+            (Some("0".into()), ReflowWidth::Infinite),
+            (Some("+0".into()), ReflowWidth::Infinite),
+            (Some("-0".into()), ReflowWidth::Infinite),
+            (Some("-1".into()), ReflowWidth::Infinite),
+            (Some("-100".into()), ReflowWidth::Infinite),
             (
                 Some("-9999999999999999999999999999999999999999".into()),
-                None,
+                ReflowWidth::Infinite,
             ),
         ]
     }
@@ -297,6 +307,23 @@ mod tests {
                 Mode::Pipe { width } => assert_eq!(width, expected, "args: {args:?}"),
                 Mode::Replace { .. } => panic!("expected pipe mode for {args:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn default_cli_width_matches_library_and_joins_long_paragraphs() {
+        let input = format!("{}\n{}\n", "word ".repeat(30).trim_end(), "more words");
+        let expected = format!("{} more words\n", "word ".repeat(30).trim_end());
+        for args in [
+            vec!["markdown-reflow".to_string()],
+            vec!["markdown-reflow".to_string(), "document.md".to_string()],
+        ] {
+            let width = match parse_args(&args).unwrap() {
+                Mode::Pipe { width } | Mode::Replace { width, .. } => width,
+            };
+            let options = options_for_width(width);
+            assert_eq!(options, Options::default());
+            assert_eq!(reflow(&input, options).unwrap(), expected);
         }
     }
 
@@ -332,7 +359,7 @@ mod tests {
                     path: actual,
                     ..
                 } => {
-                    assert_eq!(width, Some(100));
+                    assert_eq!(width, ReflowWidth::Infinite);
                     assert_eq!(actual, PathBuf::from(path));
                 }
                 Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
@@ -347,7 +374,7 @@ mod tests {
             Mode::Replace {
                 width, start, end, ..
             } => {
-                assert_eq!(width, Some(DEFAULT_WIDTH));
+                assert_eq!(width, ReflowWidth::Infinite);
                 assert_eq!((start, end), (None, None));
             }
             Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
@@ -416,11 +443,16 @@ mod tests {
         let original = "one two three\n\nfour five\n";
         fs::write(&path, original).unwrap();
 
-        run_replace(options_for_width(Some(5)), path.clone(), None, None);
+        run_replace(
+            options_for_width(ReflowWidth::Finite(5)),
+            path.clone(),
+            None,
+            None,
+        );
 
         // Defaulting to 1..=max must be equivalent to reflowing every line.
         let body = original.strip_suffix('\n').unwrap();
-        let expected = reflow(body, options_for_width(Some(5))).unwrap();
+        let expected = reflow(body, options_for_width(ReflowWidth::Finite(5))).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -433,7 +465,12 @@ mod tests {
         // Three lines; -1 selects just the last one.
         fs::write(&path, "aaa bbb\n\nccc ddd\n").unwrap();
 
-        run_replace(options_for_width(Some(3)), path.clone(), Some(-1), None);
+        run_replace(
+            options_for_width(ReflowWidth::Finite(3)),
+            path.clone(),
+            Some(-1),
+            None,
+        );
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "aaa bbb\n\nccc\nddd\n");
         fs::remove_dir_all(&dir).unwrap();
