@@ -36,6 +36,8 @@ Set all four budgets alike for uniform wrapping. Set different budgets to reserv
 
 `Options::default()` uses `Infinite` for all budgets and leaves linkification disabled. Explicit hard breaks remain intact in every mode.
 
+YAML (`---`) and TOML (`+++`) frontmatter at the start of the input is recognized when a matching closing fence is present. The frontmatter block is copied from the source, preserving indentation, comments, blank lines, and multiline values without reflow or linkification. The renderer adds a final newline if needed and normalizes spacing between Markdown blocks.
+
 For example, linkify without reflowing:
 
 ```rust

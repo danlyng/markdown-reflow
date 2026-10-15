@@ -65,7 +65,8 @@ pub struct Options {
 /// Reflow Markdown using the supplied configuration.
 ///
 /// Paragraphs are reflowed while block structure and explicit hard breaks are
-/// preserved. With the default options, existing soft breaks are joined without
+/// preserved. YAML and TOML frontmatter contents are kept without reflow or
+/// linkification. With the default options, existing soft breaks are joined without
 /// inserting new ones. To wrap uniformly, set all four width budgets alike.
 /// Set any budget to `ReflowWidth::Disabled` to skip reflow while retaining
 /// other transformations, such as linkification and table formatting.
@@ -88,6 +89,7 @@ pub struct Options {
 pub fn reflow(input: &str, reflow_options: Options) -> Result<String, String> {
     let options = markdown::ParseOptions {
         constructs: markdown::Constructs {
+            frontmatter: true,
             gfm_table: true,
             gfm_strikethrough: true,
             gfm_footnote_definition: true,
@@ -105,7 +107,7 @@ pub fn reflow(input: &str, reflow_options: Options) -> Result<String, String> {
     reflow_root(&mut ast, reflow_options.widths);
 
     let mut output = String::new();
-    render_root(&ast, &mut output);
+    render_root(&ast, input, &mut output);
     Ok(output)
 }
 
@@ -1059,8 +1061,33 @@ fn coalesce_spans(spans: &[Span]) -> Vec<Span> {
 // Markdown rendering
 // ---------------------------------------------------------------------------
 
-fn render_root(root: &Node, out: &mut String) {
+fn render_root(root: &Node, input: &str, out: &mut String) {
     if let Some(children) = root.children() {
+        if let Some(frontmatter @ (Node::Yaml(_) | Node::Toml(_))) = children.first() {
+            // The parser's value omits the final line ending, making empty
+            // content and trailing blank lines ambiguous. Keep the source
+            // block, including its fences, rather than reconstructing it.
+            if let Some(position) = frontmatter.position() {
+                let end = position.end.offset;
+                let after = &input[end..];
+                let line_ending_len = if after.starts_with("\r\n") {
+                    2
+                } else if after.starts_with(['\r', '\n']) {
+                    1
+                } else {
+                    0
+                };
+                out.push_str(&input[..end + line_ending_len]);
+                if line_ending_len == 0 {
+                    out.push('\n');
+                }
+                if children.get(1).is_some_and(needs_blank_line_before) {
+                    out.push('\n');
+                }
+                render_flow_children(&children[1..], out);
+                return;
+            }
+        }
         render_flow_children(children, out);
     }
 }
@@ -1992,9 +2019,89 @@ mod tests {
     fn test_yaml_frontmatter_preserved() {
         let input = "---\ntitle: Test\nauthor: Me\n---\n\nParagraph.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("---\n"), "got: {result:?}");
-        assert!(result.contains("title: Test\n"), "got: {result:?}");
-        assert!(result.contains("Paragraph.\n"), "got: {result:?}");
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn yaml_frontmatter_contents_are_opaque_in_every_reflow_mode() {
+        let frontmatter = concat!(
+            "---\n",
+            "# Metadata comment\n",
+            "title: '**Literal Markdown**'\n",
+            "url: https://example.com/a/very/long/path\n",
+            "tags: [one, 'two words']\n",
+            "author:\n",
+            "  name: \"Me\"\n",
+            "  active: true\n",
+            "description: |\n",
+            "  Keep these lines separate.\n",
+            "    And preserve this indentation.\n",
+            "\n",
+            "summary: >-\n",
+            "  Do not join these\n",
+            "  lines in the YAML source.\n",
+            "---\n",
+        );
+        let input = format!("{frontmatter}\nBody text\nwraps here.\n");
+        for (options, body) in [
+            (uniform_options(10), "Body text\nwraps\nhere.\n"),
+            (Options::default(), "Body text wraps here.\n"),
+            (
+                Options {
+                    widths: EdgeWidths {
+                        middle: ReflowWidth::Disabled,
+                        ..EdgeWidths::default()
+                    },
+                    ..Options::default()
+                },
+                "Body text\nwraps here.\n",
+            ),
+        ] {
+            let options = Options {
+                linkify_urls: true,
+                ..options
+            };
+            assert_eq!(
+                reflow(&input, options).unwrap(),
+                format!("{frontmatter}\n{body}"),
+                "options: {options:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_frontmatter_can_be_empty_or_the_entire_document() {
+        for input in [
+            "---\n---\n",
+            "---\ntitle: Test\n---\n",
+            "---\n\n---\n",
+            "---\ntitle: Test\n\n\n---\n",
+            "---  \ntitle: Test  \n--- \n",
+            "---\r\ntitle: Test\r\n\r\n---\r\n",
+        ] {
+            assert_eq!(reflow(input, uniform_options(1)).unwrap(), input);
+        }
+        assert_eq!(
+            reflow("---\ntitle: Test\n---", Options::default()).unwrap(),
+            "---\ntitle: Test\n---\n"
+        );
+    }
+
+    #[test]
+    fn toml_frontmatter_preserved() {
+        for input in ["+++\n+++\n", "+++\ntitle = 'Test'\n\n+++\n\nParagraph.\n"] {
+            assert_eq!(reflow(input, uniform_options(80)).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn frontmatter_recognition_does_not_consume_body_thematic_breaks() {
+        let input = "---\ntitle: Test\n---\n\nBefore.\n\n---\n\nAfter.\n";
+        assert_eq!(reflow(input, Options::default()).unwrap(), input);
+        let input = "Before.\n\n---\n\nAfter.\n\n---\n";
+        assert_eq!(reflow(input, Options::default()).unwrap(), input);
+        let input = "---\n\nParagraph without a closing fence.\n";
+        assert_eq!(reflow(input, Options::default()).unwrap(), input);
     }
 
     #[test]

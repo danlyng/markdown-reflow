@@ -113,6 +113,32 @@ fn width_flags_reflow_stdin() {
 }
 
 #[test]
+fn yaml_frontmatter_survives_stdin_and_file_reflow() {
+    let frontmatter = "---\ntitle: '**Literal Markdown**'\ntags:\n  - one\n  - two\ndescription: |\n  Keep these\n  lines separate.\n\n---\n";
+    let input = format!("{frontmatter}\naaa bbb\nccc ddd\n");
+    let dir = Fixture::new();
+    for (flags, body) in [
+        (vec![], "aaa bbb ccc ddd\n"),
+        (vec!["--width", "3"], "aaa\nbbb\nccc\nddd\n"),
+    ] {
+        let expected = format!("{frontmatter}\n{body}");
+        let output = run(&flags, &input);
+        assert!(output.status.success(), "{flags:?}: {output:?}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+
+        dir.write("note.md", &input);
+        let mut args = flags;
+        args.push("note.md");
+        let output = dir.run(&args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(dir.read("note.md"), expected);
+    }
+}
+
+#[test]
 fn clap_reports_invalid_flags_and_ranges_before_editing() {
     let dir = Fixture::new();
     dir.write("document.md", "aaa bbb\n");
