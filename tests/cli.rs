@@ -142,22 +142,46 @@ fn yaml_frontmatter_survives_stdin_and_file_reflow() {
 fn clap_reports_invalid_flags_and_ranges_before_editing() {
     let dir = Fixture::new();
     dir.write("document.md", "aaa bbb\n");
-    for args in [
-        vec!["document.md", "--from", "0"],
-        vec!["--width", "80", "document.md", "--from", "one"],
-        vec!["document.md", "--to", "0"],
-        vec!["document.md", "--width", "wide"],
-        vec!["document.md", "--to", "999999999999999999999999999"],
-        vec!["document.md", "--unknown"],
-        vec!["--from", "1"],
-        vec!["--to", "-1"],
+    for (args, diagnostic) in [
+        (
+            vec!["document.md", "--from", "0"],
+            "invalid from line: 0 (must be nonzero)",
+        ),
+        (
+            vec!["--width", "80", "document.md", "--from", "one"],
+            "invalid from line: one",
+        ),
+        (
+            vec!["document.md", "--to", "0"],
+            "invalid to line: 0 (must be nonzero)",
+        ),
+        (
+            vec!["document.md", "--width", "wide"],
+            "width must be an integer; try --width 80 or --width 0",
+        ),
+        (
+            vec!["document.md", "--to", "999999999999999999999999999"],
+            "invalid to line: 999999999999999999999999999",
+        ),
+        (
+            vec!["document.md", "--unknown"],
+            "unexpected argument '--unknown'",
+        ),
+        (
+            vec!["--from", "1"],
+            "the following required arguments were not provided:\n  <FILE>...",
+        ),
+        (
+            vec!["--to", "-1"],
+            "the following required arguments were not provided:\n  <FILE>...",
+        ),
     ] {
         let output = dir.run(&args);
-        assert!(!output.status.success(), "{args:?}");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
         assert!(output.stdout.is_empty());
         let error = String::from_utf8(output.stderr).unwrap();
-        assert!(error.contains("error:"), "{args:?}: {error}");
-        assert!(!error.contains("error reading"), "{args:?}: {error}");
+        assert!(error.starts_with("error:"), "{args:?}: {error}");
+        assert!(error.contains(diagnostic), "{args:?}: {error}");
         assert!(!error.contains('\u{1b}'));
         assert_eq!(dir.read("document.md"), "aaa bbb\n");
     }
@@ -204,6 +228,8 @@ fn negative_ranges_resolve_independently_for_each_file() {
         "--width", "3", "--from", "-2", "--to", "-2", "one.md", "two.md",
     ]);
     assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     assert_eq!(dir.read("one.md"), "keep this\naaa\nbbb\nkeep that\n");
     assert_eq!(
         dir.read("two.md"),
@@ -223,6 +249,8 @@ fn each_bound_can_be_omitted() {
         args.extend(flags);
         let output = dir.run(&args);
         assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
         assert_eq!(dir.read("doc.md"), expected);
     }
 }
@@ -241,11 +269,19 @@ fn batch_errors_name_the_file_and_continue_processing() {
         "short.md",
         "good.md",
     ]);
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stdout.is_empty());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("missing.md"));
-    assert!(error.contains("short.md"));
+    let errors: Vec<_> = error.lines().collect();
+    assert_eq!(errors.len(), 2, "{error}");
+    assert!(
+        errors[0].starts_with("error: missing.md: cannot read file: "),
+        "{error}"
+    );
+    assert_eq!(
+        errors[1],
+        "error: short.md: invalid line range: from=2, to=1; use --from <= --to"
+    );
     assert_eq!(dir.read("short.md"), "aaa bbb\n");
     assert_eq!(dir.read("good.md"), "keep this\nccc\nddd\n");
 }
@@ -266,6 +302,8 @@ fn numeric_and_dash_prefixed_paths_can_be_edited_together() {
         "has spaces.md",
     ]);
     assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     for name in ["80", "-notes.md", "--from", "has spaces.md"] {
         assert_eq!(dir.read(name), "aaa\nbbb\n");
     }

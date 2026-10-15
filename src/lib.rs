@@ -1582,6 +1582,39 @@ mod tests {
         }
     }
 
+    /// Check content and container prefixes as well as the width constraint.
+    fn assert_wrapped_text(
+        output: &str,
+        text: &str,
+        width: usize,
+        first_prefix: &str,
+        continuation_prefix: &str,
+    ) {
+        let mut words = Vec::new();
+        for (index, line) in output.lines().enumerate() {
+            assert!(
+                line.chars().count() <= width,
+                "width {width}: line too long: {line:?}"
+            );
+            let prefix = if index == 0 {
+                first_prefix
+            } else {
+                continuation_prefix
+            };
+            let content = line
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("width {width}: missing prefix {prefix:?} in {line:?}"));
+            assert!(!content.is_empty(), "unexpected blank line: {output:?}");
+            words.extend(content.split_whitespace());
+        }
+        assert_eq!(
+            words,
+            text.split_whitespace().collect::<Vec<_>>(),
+            "width {width}: content changed: {output:?}"
+        );
+        assert!(output.ends_with('\n'), "missing final newline: {output:?}");
+    }
+
     #[test]
     fn unlimited_width_joins_soft_breaks_and_preserves_formatting() {
         let input = "Hello **bold\ntext** and [a\nlink](https://example.com).\nMore text.\n";
@@ -1751,14 +1784,10 @@ mod tests {
     fn test_simple_paragraph_reflow() {
         let input = "This is a paragraph that needs to be reflowed to a narrower width.\n";
         let result = reflow(input, uniform_options(40)).unwrap();
-        // Should have line breaks at appropriate places.
-        for line in result.lines() {
-            assert!(
-                line.len() <= 40,
-                "line too long ({} chars): {line:?}",
-                line.len()
-            );
-        }
+        assert_eq!(
+            result,
+            "This is a paragraph that needs to be\nreflowed to a narrower width.\n"
+        );
     }
 
     #[test]
@@ -1787,64 +1816,42 @@ mod tests {
     fn test_headings_not_combined() {
         let input = "# Hello\n# World\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(
-            result.contains("# Hello\n"),
-            "expected '# Hello' heading: {result:?}"
-        );
-        assert!(
-            result.contains("# World\n"),
-            "expected '# World' heading: {result:?}"
-        );
+        assert_eq!(result, "# Hello\n\n# World\n");
     }
 
     #[test]
     fn test_list_items_not_combined() {
         let input = "* First item\n* Second item\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("* First item\n"), "got: {result:?}");
-        assert!(result.contains("* Second item\n"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_inline_formatting_preserved() {
         let input = "This is **bold** and *italic* text.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("**bold**"), "got: {result:?}");
-        assert!(result.contains("*italic*"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_code_block_preserved() {
         let input = "```rust\nlet x = 1;\nlet y = 2;\n```\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(
-            result.contains("```rust\nlet x = 1;\nlet y = 2;\n```\n"),
-            "got: {result:?}"
-        );
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_blockquote_preserved() {
         let input = "> A blockquote with some text.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(
-            result.contains("> A blockquote with some text.\n"),
-            "got: {result:?}"
-        );
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_reflow_narrow() {
         let input = "The quick brown fox jumps over the lazy dog.\n";
         let result = reflow(input, uniform_options(20)).unwrap();
-        for line in result.lines() {
-            assert!(line.len() <= 20, "line too long: {line:?}");
-        }
-        // The text should be split into multiple lines.
-        assert!(
-            result.lines().count() > 1,
-            "expected multiple lines: {result:?}"
-        );
+        assert_eq!(result, "The quick brown fox\njumps over the lazy\ndog.\n");
     }
 
     #[test]
@@ -1852,13 +1859,10 @@ mod tests {
         let input =
             "This is a long paragraph with **bold text that might need to span** across lines.\n";
         let result = reflow(input, uniform_options(40)).unwrap();
-        // The bold text might be split across lines; this is valid markdown.
-        // Count total ** markers in the whole output — should be balanced.
-        let total_open = result.matches("**").count();
-        assert_eq!(total_open % 2, 0, "unbalanced ** total: {result:?}");
-        // Text content should remain the same.
-        assert!(result.contains("**bold"), "missing bold open: {result:?}");
-        assert!(result.contains("span**"), "missing close bold: {result:?}");
+        assert_eq!(
+            result,
+            "This is a long paragraph with **bold\ntext that might need to span** across\nlines.\n"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1869,53 +1873,42 @@ mod tests {
     fn test_links_preserved() {
         let input = "See [the docs](https://example.com) for more.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(
-            result.contains("[the docs](https://example.com)"),
-            "got: {result:?}"
-        );
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_link_with_inline_formatting() {
         let input = "See **[the docs](https://example.com)** for more.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(
-            result.contains("[the docs](https://example.com)"),
-            "got: {result:?}"
-        );
-        assert!(result.contains("**"), "missing strong: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_ordered_list_preserved() {
         let input = "1. First\n2. Second\n3. Third\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("1. First\n"), "got: {result:?}");
-        assert!(result.contains("2. Second\n"), "got: {result:?}");
-        assert!(result.contains("3. Third\n"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_nested_blockquote() {
         let input = "> > Nested quote\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("> > Nested quote\n"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_thematic_break_preserved() {
         let input = "Before\n\n---\n\nAfter\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("---\n"), "got: {result:?}");
-        assert!(result.contains("Before\n"), "got: {result:?}");
-        assert!(result.contains("After\n"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_image_preserved() {
         let input = "Look at ![alt text](image.png).\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("![alt text](image.png)"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
@@ -1923,62 +1916,49 @@ mod tests {
         // Inline code is atomic — even at narrow widths it stays intact.
         let input = "Run `cargo build --release` now.\n";
         let result = reflow(input, uniform_options(25)).unwrap();
-        // The inline code must appear in full somewhere on one line.
-        let on_one_line = result
-            .lines()
-            .any(|l| l.contains("`cargo build --release`"));
-        assert!(on_one_line, "inline code was split: {result:?}");
+        assert_eq!(result, "Run\n`cargo build --release`\nnow.\n");
     }
 
     #[test]
     fn test_hard_break_preserved() {
         let input = "Line one.\\\nLine two.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("\\\n"), "hard break lost: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_mixed_bold_italic() {
         let input = "This is ***bold and italic*** and **just bold** and *just italic*.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("***bold and italic***"), "got: {result:?}");
-        assert!(result.contains("**just bold**"), "got: {result:?}");
-        assert!(result.contains("*just italic*"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_multiple_paragraphs_blank_line() {
         let input = "First paragraph.\n\nSecond paragraph.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        // Must be at least one blank line between paragraphs.
-        assert!(
-            result.contains("\n\n"),
-            "no blank line between paragraphs: {result:?}"
-        );
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_double_space_sentence_end_preserved() {
         let input = "First sentence.  Second sentence.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains(".  "), "double space lost: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_unicode_preserved() {
         let input = "Café résumé naïve — très élégant.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("Café"), "got: {result:?}");
-        assert!(result.contains("résumé"), "got: {result:?}");
-        assert!(result.contains("—"), "em-dash lost: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_empty_paragraph() {
         let input = "Before\n\n\n\nAfter\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("Before\n"), "got: {result:?}");
-        assert!(result.contains("After\n"), "got: {result:?}");
+        assert_eq!(result, "Before\n\nAfter\n");
     }
 
     #[test]
@@ -1986,10 +1966,9 @@ mod tests {
         // A word longer than the target width must still be emitted.
         let input = "AReallyLongWordThatExceedsTheTargetWidth significantly.\n";
         let result = reflow(input, uniform_options(20)).unwrap();
-        // The long word appears in the output — it just gets its own line.
-        assert!(
-            result.contains("AReallyLongWordThatExceedsTheTargetWidth"),
-            "long word lost: {result:?}"
+        assert_eq!(
+            result,
+            "AReallyLongWordThatExceedsTheTargetWidth\nsignificantly.\n"
         );
     }
 
@@ -1999,20 +1978,21 @@ mod tests {
             "This paragraph is wrapped tightly.\nIt has several lines that could\nbe merged.\n";
         let narrow = reflow(input, uniform_options(30)).unwrap();
         let wide = reflow(input, uniform_options(200)).unwrap();
-        assert!(
-            wide.lines().count() < narrow.lines().count(),
-            "wider width should produce fewer lines"
+        assert_eq!(
+            narrow,
+            "This paragraph is wrapped\ntightly. It has several lines\nthat could be merged.\n"
+        );
+        assert_eq!(
+            wide,
+            "This paragraph is wrapped tightly. It has several lines that could be merged.\n"
         );
     }
 
     #[test]
     fn test_reflow_at_small_width() {
         let input = "Short word.\n";
-        // At width 6, the line should be <= 6 chars.
         let result = reflow(input, uniform_options(6)).unwrap();
-        for line in result.lines() {
-            assert!(line.chars().count() <= 6, "line too long: {line:?}");
-        }
+        assert_eq!(result, "Short\nword.\n");
     }
 
     #[test]
@@ -2108,17 +2088,14 @@ mod tests {
     fn test_definition_preserved() {
         let input = "[ref]: https://example.com \"Title\"\n\nSee [ref] for more.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(
-            result.contains("[ref]: https://example.com"),
-            "got: {result:?}"
-        );
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_footnote_preserved() {
         let input = "Text with footnote[^1].\n\n[^1]: The footnote.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("[^1]"), "footnote ref lost: {result:?}");
+        assert_eq!(result, "Text with footnote[^1].\n[^1]: The footnote.\n\n");
     }
 
     #[test]
@@ -2155,9 +2132,7 @@ mod tests {
     fn test_table_preserved() {
         let input = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("| A   | B   |\n"), "got: {result:?}");
-        assert!(result.contains("| --- | --- |\n"), "got: {result:?}");
-        assert!(result.contains("| 1   | 2   |\n"), "got: {result:?}");
+        assert_eq!(result, "| A   | B   |\n| --- | --- |\n| 1   | 2   |\n");
     }
 
     #[test]
@@ -2206,12 +2181,7 @@ mod tests {
     fn test_list_item_with_nested_paragraph() {
         let input = "* Item one.\n\n  Paragraph under item.\n* Item two.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("* Item one.\n"), "got: {result:?}");
-        assert!(
-            result.contains("Paragraph under item.\n"),
-            "got: {result:?}"
-        );
-        assert!(result.contains("* Item two.\n"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
@@ -2220,13 +2190,7 @@ mod tests {
         let input = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.\n";
         for width in [20, 40, 60, 80, 100] {
             let result = reflow(input, uniform_options(width)).unwrap();
-            for line in result.lines() {
-                assert!(
-                    line.chars().count() <= width,
-                    "width {width}: line too long ({chars}): {line:?}",
-                    chars = line.chars().count()
-                );
-            }
+            assert_wrapped_text(&result, input, width, "", "");
         }
     }
 
@@ -2234,19 +2198,17 @@ mod tests {
     fn test_delete_formatting_preserved() {
         let input = "This is ~~deleted~~ text.\n";
         let result = reflow(input, uniform_options(80)).unwrap();
-        assert!(result.contains("~~deleted~~"), "got: {result:?}");
+        assert_eq!(result, input);
     }
 
     #[test]
     fn test_no_trailing_whitespace_on_lines() {
         let input = "A paragraph that gets reflowed to a specific width.\n";
         let result = reflow(input, uniform_options(30)).unwrap();
-        for line in result.lines() {
-            assert!(
-                !line.ends_with(' ') && !line.ends_with('\t'),
-                "trailing whitespace: {line:?}"
-            );
-        }
+        assert_eq!(
+            result,
+            "A paragraph that gets\nreflowed to a specific width.\n"
+        );
     }
 
     #[test]
@@ -2254,11 +2216,7 @@ mod tests {
         // A word longer than the target width gets its own line.
         let input = "Supercalifragilisticexpialidocious.\n";
         let result = reflow(input, uniform_options(20)).unwrap();
-        // The long word must appear intact somewhere.
-        assert!(
-            result.contains("Supercalifragilisticexpialidocious"),
-            "long word lost: {result:?}"
-        );
+        assert_eq!(result, input);
     }
 
     #[test]
@@ -2267,13 +2225,13 @@ mod tests {
         let input = "* This is a bullet point that should be reflowed to stay within the character limit.\n";
         for width in [20, 40, 60, 80] {
             let result = reflow(input, uniform_options(width)).unwrap();
-            for line in result.lines() {
-                assert!(
-                    line.chars().count() <= width,
-                    "width {width}: line too long ({chars}): {line:?}",
-                    chars = line.chars().count()
-                );
-            }
+            assert_wrapped_text(
+                &result,
+                input.strip_prefix("* ").unwrap(),
+                width,
+                "* ",
+                "  ",
+            );
         }
     }
 
@@ -2282,13 +2240,13 @@ mod tests {
         let input = "1. This is an ordered bullet point that should be reflowed to stay within the character limit.\n";
         for width in [20, 40, 60, 80] {
             let result = reflow(input, uniform_options(width)).unwrap();
-            for line in result.lines() {
-                assert!(
-                    line.chars().count() <= width,
-                    "width {width}: line too long ({chars}): {line:?}",
-                    chars = line.chars().count()
-                );
-            }
+            assert_wrapped_text(
+                &result,
+                input.strip_prefix("1. ").unwrap(),
+                width,
+                "1. ",
+                "   ",
+            );
         }
     }
 
@@ -2298,13 +2256,13 @@ mod tests {
             "> This is a blockquote that should be reflowed to stay within the character limit.\n";
         for width in [20, 40, 60, 80] {
             let result = reflow(input, uniform_options(width)).unwrap();
-            for line in result.lines() {
-                assert!(
-                    line.chars().count() <= width,
-                    "width {width}: line too long ({chars}): {line:?}",
-                    chars = line.chars().count()
-                );
-            }
+            assert_wrapped_text(
+                &result,
+                input.strip_prefix("> ").unwrap(),
+                width,
+                "> ",
+                "> ",
+            );
         }
     }
 }

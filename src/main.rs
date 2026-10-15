@@ -335,8 +335,14 @@ mod tests {
         assert_eq!(resolve_line("end", -1, 10).unwrap(), 10);
         assert_eq!(resolve_line("start", -10, 10).unwrap(), 1);
         // Indices pointing before the first line are errors.
-        assert!(resolve_line("start", -11, 10).is_err());
-        assert!(resolve_line("end", -20, 10).is_err());
+        assert_eq!(
+            resolve_line("start", -11, 10).unwrap_err(),
+            "start line -11 is out of range (file has 10 lines)"
+        );
+        assert_eq!(
+            resolve_line("end", -20, 10).unwrap_err(),
+            "end line -20 is out of range (file has 10 lines)"
+        );
     }
 
     #[test]
@@ -349,10 +355,10 @@ mod tests {
 
         run_replace(options_for_width(ReflowWidth::Finite(5)), &path, None, None).unwrap();
 
-        // Defaulting to 1..=max must be equivalent to reflowing every line.
-        let body = original.strip_suffix('\n').unwrap();
-        let expected = reflow(body, options_for_width(ReflowWidth::Finite(5))).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "one\ntwo\nthree\n\nfour\nfive\n"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
