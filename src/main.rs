@@ -1,41 +1,52 @@
+use clap::{ColorChoice, Parser};
 use markdown_reflow::{EdgeWidths, Options, ReflowWidth, reflow};
 
-use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process;
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+#[derive(Debug, Parser)]
+#[command(version, about = "Reflow Markdown while preserving block structure and hard breaks",
+    color = ColorChoice::Never,
+    after_help = "Examples:\n  markdown-reflow --width 80 < input.md > output.md\n  markdown-reflow --width 0 *.md\n  markdown-reflow --width 80 --from 2 --to -1 notes/*.md\n\nLine numbers are 1-indexed and inclusive. Negative values count from the end\n(-1 = last line). The same range is applied independently to each file.")]
+struct Cli {
+    /// Wrap width (default: infinite); zero or negative values join soft breaks
+    #[arg(long, default_value = "0", hide_default_value = true, value_parser = parse_width, allow_hyphen_values = true)]
+    width: ReflowWidth,
 
-    // Determine mode and parse arguments.
-    match parse_args(&args) {
-        Ok(Mode::Pipe { width }) => run_pipe(options_for_width(width)),
-        Ok(Mode::Replace {
-            width,
-            path,
-            start,
-            end,
-        }) => run_replace(options_for_width(width), path, start, end),
-        Err(e) => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("usage:");
-            eprintln!("  markdown-reflow [width]                      — reflow stdin → stdout");
-            eprintln!(
-                "  markdown-reflow [width] <file> [start] [end] — reflow line range in-place"
-            );
-            eprintln!();
-            eprintln!("  width defaults to infinite (join soft breaks without wrapping).");
-            eprintln!(
-                "  positive values wrap at that width; zero or negative values use infinite."
-            );
-            eprintln!("  line numbers are 1-indexed and inclusive; negative values count from");
-            eprintln!("  the end of the file (-1 = last line). start defaults to 1 and end to");
-            eprintln!("  the last line, so `<file>` alone reflows the whole file.");
-            process::exit(1);
+    /// First line, inclusive (default: 1); requires at least one file
+    #[arg(long, value_name = "LINE", requires = "files", allow_negative_numbers = true,
+        value_parser = |s: &str| parse_line_arg(s, "from"))]
+    from: Option<isize>,
+
+    /// Last line, inclusive (default: -1, the last line); requires a file
+    #[arg(long, value_name = "LINE", requires = "files", allow_negative_numbers = true,
+        value_parser = |s: &str| parse_line_arg(s, "to"))]
+    to: Option<isize>,
+
+    /// Files to edit in place; omit to read stdin and write stdout
+    #[arg(value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    files: Vec<PathBuf>,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let options = options_for_width(cli.width);
+    if cli.files.is_empty() {
+        run_pipe(options);
+        return;
+    }
+
+    let mut failed = false;
+    for path in &cli.files {
+        if let Err(error) = run_replace(options, path, cli.from, cli.to) {
+            eprintln!("error: {}: {error}", path.display());
+            failed = true;
         }
+    }
+    if failed {
+        process::exit(1);
     }
 }
 
@@ -52,80 +63,22 @@ fn options_for_width(width: ReflowWidth) -> Options {
     }
 }
 
-enum Mode {
-    /// Read from stdin, write to stdout.
-    Pipe { width: ReflowWidth },
-    /// Edit a file in-place: reflow lines `start..=end` (1-indexed, inclusive).
-    /// Missing bounds default to the whole file; negative indices count from
-    /// the end (-1 = last line).
-    Replace {
-        width: ReflowWidth,
-        path: PathBuf,
-        start: Option<isize>,
-        end: Option<isize>,
-    },
-}
-
-fn parse_args(args: &[String]) -> Result<Mode, String> {
-    let args = &args[1..]; // skip program name
-
-    if args.is_empty() {
-        return Ok(Mode::Pipe {
-            width: ReflowWidth::default(),
-        });
-    }
-
-    // First positional arg may be a width (integer) or a file path.
-    let (width, rest) = if let Ok(w) = args[0].parse::<usize>() {
-        (
-            if w == 0 {
-                ReflowWidth::Infinite
-            } else {
-                ReflowWidth::Finite(w)
-            },
-            &args[1..],
-        )
-    } else if args[0]
+fn parse_width(arg: &str) -> Result<ReflowWidth, String> {
+    if let Ok(width) = arg.parse::<usize>() {
+        Ok(if width == 0 {
+            ReflowWidth::Infinite
+        } else {
+            ReflowWidth::Finite(width)
+        })
+    } else if arg
         .strip_prefix('-')
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
     {
-        // Only the sign matters for negative widths, so avoid integer range limits.
-        (ReflowWidth::Infinite, &args[1..])
+        // Only the sign matters for negative widths, avoiding integer limits.
+        Ok(ReflowWidth::Infinite)
     } else {
-        (ReflowWidth::default(), args)
-    };
-
-    if rest.is_empty() {
-        return Ok(Mode::Pipe { width });
+        Err("width must be an integer; try --width 80 or --width 0".into())
     }
-
-    // A file path plus up to two line numbers is replace mode; omitted line
-    // numbers default to the first and last line respectively.
-    let line_args = &rest[1..];
-    let (start, end) = match line_args.len() {
-        0 => (None, None),
-        1 => (Some(parse_line_arg(&line_args[0], "start")?), None),
-        2 => (
-            Some(parse_line_arg(&line_args[0], "start")?),
-            Some(parse_line_arg(&line_args[1], "end")?),
-        ),
-        _ => {
-            return Err(format!(
-                "unexpected arguments: {}",
-                rest.iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
-        }
-    };
-
-    Ok(Mode::Replace {
-        width,
-        path: PathBuf::from(&rest[0]),
-        start,
-        end,
-    })
 }
 
 /// Parse a line-number argument: positive values are 1-indexed from the start
@@ -164,46 +117,34 @@ fn run_pipe(options: Options) {
 // Replace mode: in-place line-range editing
 // ---------------------------------------------------------------------------
 
-fn run_replace(options: Options, path: PathBuf, start: Option<isize>, end: Option<isize>) {
+fn run_replace(
+    options: Options,
+    path: &std::path::Path,
+    start: Option<isize>,
+    end: Option<isize>,
+) -> Result<(), String> {
     // Read the file.
-    let original = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", path.display());
-            process::exit(1);
-        }
-    };
+    let original = fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
 
     // Extract the line range (1-indexed, inclusive).
     let lines: Vec<&str> = original.lines().collect();
     let total_lines = lines.len();
     if total_lines == 0 {
-        return; // no lines to reflow
+        return Ok(()); // no lines to reflow
     }
 
     // Missing bounds default to the whole file: line 1 through the last line.
-    let start = match resolve_line("start", start.unwrap_or(1), total_lines) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
-    let end = match resolve_line("end", end.unwrap_or(-1), total_lines) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
-
+    let start = resolve_line("from", start.unwrap_or(1), total_lines)?;
+    let end = resolve_line("to", end.unwrap_or(-1), total_lines)?;
     if start > end {
-        eprintln!("error: invalid line range: start={start}, end={end} (must be 1 ≤ start ≤ end)");
-        process::exit(1);
+        return Err(format!(
+            "invalid line range: from={start}, to={end}; use --from <= --to"
+        ));
     }
     if start > total_lines {
-        eprintln!("error: start line {start} exceeds file length ({total_lines} lines)");
-        process::exit(1);
+        return Err(format!(
+            "from line {start} exceeds file length ({total_lines} lines)"
+        ));
     }
     let actual_end = end.min(total_lines);
 
@@ -211,13 +152,7 @@ fn run_replace(options: Options, path: PathBuf, start: Option<isize>, end: Optio
     let input_txt = lines[start - 1..actual_end].join("\n");
 
     // Reflow.
-    let output_txt = match reflow(&input_txt, options) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
+    let output_txt = reflow(&input_txt, options)?;
 
     // Rebuild the file: lines before the range + reflowed output + lines after.
     let before: Vec<&str> = lines[..start - 1].to_vec();
@@ -247,11 +182,7 @@ fn run_replace(options: Options, path: PathBuf, start: Option<isize>, end: Optio
         result.push('\n');
     }
 
-    // Write back.
-    if let Err(e) = fs::write(&path, &result) {
-        eprintln!("error writing {}: {e}", path.display());
-        process::exit(1);
-    }
+    fs::write(path, &result).map_err(|e| format!("cannot write file: {e}"))
 }
 
 /// Resolve a parsed line number against the file length: positive values are
@@ -275,6 +206,7 @@ fn resolve_line(which: &str, n: isize, total_lines: usize) -> Result<usize, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     fn width_cases() -> Vec<(Option<String>, ReflowWidth)> {
         vec![
@@ -301,12 +233,14 @@ mod tests {
     #[test]
     fn pipe_widths() {
         for (arg, expected) in width_cases() {
-            let mut args = vec!["markdown-reflow".into()];
-            args.extend(arg);
-            match parse_args(&args).unwrap() {
-                Mode::Pipe { width } => assert_eq!(width, expected, "args: {args:?}"),
-                Mode::Replace { .. } => panic!("expected pipe mode for {args:?}"),
+            let mut args = vec!["markdown-reflow".to_string()];
+            if let Some(arg) = arg {
+                args.extend(["--width".into(), arg]);
             }
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert_eq!(cli.width, expected, "args: {args:?}");
+            assert!(cli.files.is_empty());
+            assert_eq!((cli.from, cli.to), (None, None));
         }
     }
 
@@ -318,108 +252,78 @@ mod tests {
             vec!["markdown-reflow".to_string()],
             vec!["markdown-reflow".to_string(), "document.md".to_string()],
         ] {
-            let width = match parse_args(&args).unwrap() {
-                Mode::Pipe { width } | Mode::Replace { width, .. } => width,
-            };
-            let options = options_for_width(width);
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let options = options_for_width(cli.width);
             assert_eq!(options, Options::default());
             assert_eq!(reflow(&input, options).unwrap(), expected);
         }
     }
 
     #[test]
-    fn replace_widths() {
-        for (arg, expected) in width_cases() {
-            let mut args = vec!["markdown-reflow".into()];
-            args.extend(arg);
-            args.extend(["document.md".into(), "2".into(), "5".into()]);
-            match parse_args(&args).unwrap() {
-                Mode::Replace {
-                    width,
-                    path,
-                    start,
-                    end,
-                } => {
-                    assert_eq!(width, expected, "args: {args:?}");
-                    assert_eq!(path, PathBuf::from("document.md"));
-                    assert_eq!((start, end), (Some(2), Some(5)));
-                }
-                Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
-            }
-        }
+    fn multiple_files_and_flags_in_any_order() {
+        let cli = Cli::try_parse_from([
+            "markdown-reflow",
+            "one.md",
+            "--to",
+            "-1",
+            "--width",
+            "80",
+            "two.md",
+            "--from",
+            "-3",
+        ])
+        .unwrap();
+        assert_eq!(cli.width, ReflowWidth::Finite(80));
+        assert_eq!((cli.from, cli.to), (Some(-3), Some(-1)));
+        assert_eq!(
+            cli.files,
+            [PathBuf::from("one.md"), PathBuf::from("two.md")]
+        );
     }
 
     #[test]
-    fn non_numeric_negative_prefix_is_a_path() {
-        for path in ["-", "-notes.md", "-1.md", "--1", "-+1"] {
-            let args = ["markdown-reflow", path, "1", "2"].map(String::from);
-            match parse_args(&args).unwrap() {
-                Mode::Replace {
-                    width,
-                    path: actual,
-                    ..
-                } => {
-                    assert_eq!(width, ReflowWidth::Infinite);
-                    assert_eq!(actual, PathBuf::from(path));
-                }
-                Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
-            }
-        }
+    fn numeric_and_dash_prefixed_filenames() {
+        let cli =
+            Cli::try_parse_from(["markdown-reflow", "--", "80", "-notes.md", "--from"]).unwrap();
+        assert_eq!(cli.files, ["80", "-notes.md", "--from"].map(PathBuf::from));
+        assert_eq!(cli.width, ReflowWidth::Infinite);
     }
 
     #[test]
-    fn replace_without_line_numbers_defaults_to_whole_file() {
-        let args = ["markdown-reflow", "document.md"].map(String::from);
-        match parse_args(&args).unwrap() {
-            Mode::Replace {
-                width, start, end, ..
-            } => {
-                assert_eq!(width, ReflowWidth::Infinite);
-                assert_eq!((start, end), (None, None));
-            }
-            Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
-        }
-    }
-
-    #[test]
-    fn replace_ranges_with_negative_indices() {
-        for (line_args, expected) in [
-            (vec!["3"], (Some(3), None)),
-            (vec!["-3"], (Some(-3), None)),
-            (vec!["1", "-1"], (Some(1), Some(-1))),
-            (vec!["-2", "-1"], (Some(-2), Some(-1))),
-            (vec!["-1", "5"], (Some(-1), Some(5))),
+    fn range_bounds_are_independent() {
+        for (flags, expected) in [
+            (vec![], (None, None)),
+            (vec!["--from", "3"], (Some(3), None)),
+            (vec!["--from", "-3"], (Some(-3), None)),
+            (vec!["--to", "5"], (None, Some(5))),
+            (vec!["--from", "1", "--to", "-1"], (Some(1), Some(-1))),
         ] {
-            let mut args = vec!["markdown-reflow".to_string(), "document.md".to_string()];
-            args.extend(line_args.iter().map(|s| s.to_string()));
-            match parse_args(&args).unwrap() {
-                Mode::Replace { start, end, .. } => {
-                    assert_eq!((start, end), expected, "args: {args:?}")
-                }
-                Mode::Pipe { .. } => panic!("expected replace mode for {args:?}"),
-            }
+            let mut args = vec!["markdown-reflow", "document.md"];
+            args.extend(flags);
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!((cli.from, cli.to), expected);
         }
     }
 
     #[test]
-    fn zero_line_numbers_are_rejected() {
-        for line_args in [
-            vec!["0"],
-            vec!["0", "5"],
-            vec!["5", "0"],
-            vec!["-0", "1"],
-            vec!["+0", "1"],
+    fn invalid_flags_and_ranges_are_rejected() {
+        for args in [
+            vec!["--width", "wide"],
+            vec!["--width"],
+            vec!["--from", "0", "document.md"],
+            vec!["--to", "-0", "document.md"],
+            vec!["--from", "one", "document.md"],
+            vec!["--to", "999999999999999999999999", "document.md"],
+            vec!["--from", "1"],
+            vec!["--to", "-1"],
+            vec!["--unknown"],
         ] {
-            let mut args = vec!["markdown-reflow".to_string(), "document.md".to_string()];
-            args.extend(line_args.iter().map(|s| s.to_string()));
-            assert!(parse_args(&args).is_err(), "expected error for {args:?}");
+            assert!(
+                Cli::try_parse_from(std::iter::once("markdown-reflow").chain(args.iter().copied()))
+                    .is_err(),
+                "args: {args:?}"
+            );
         }
-    }
-
-    #[test]
-    fn too_many_line_numbers_are_rejected() {
-        let args = ["markdown-reflow", "document.md", "1", "2", "3"].map(String::from);
-        assert!(parse_args(&args).is_err());
     }
 
     #[test]
@@ -443,12 +347,7 @@ mod tests {
         let original = "one two three\n\nfour five\n";
         fs::write(&path, original).unwrap();
 
-        run_replace(
-            options_for_width(ReflowWidth::Finite(5)),
-            path.clone(),
-            None,
-            None,
-        );
+        run_replace(options_for_width(ReflowWidth::Finite(5)), &path, None, None).unwrap();
 
         // Defaulting to 1..=max must be equivalent to reflowing every line.
         let body = original.strip_suffix('\n').unwrap();
@@ -467,10 +366,11 @@ mod tests {
 
         run_replace(
             options_for_width(ReflowWidth::Finite(3)),
-            path.clone(),
+            &path,
             Some(-1),
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "aaa bbb\n\nccc\nddd\n");
         fs::remove_dir_all(&dir).unwrap();
