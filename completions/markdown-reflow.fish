@@ -1,0 +1,5 @@
+complete -c markdown-reflow -l width -x -d 'Wrap width (default: 100; nonpositive disables wrapping)'
+complete -c markdown-reflow -l from -x -d 'First line, inclusive (default: 1)'
+complete -c markdown-reflow -l to -x -d 'Last line, inclusive (default: -1)'
+complete -c markdown-reflow -s h -l help -d 'Print help'
+complete -c markdown-reflow -s V -l version -d 'Print version'
