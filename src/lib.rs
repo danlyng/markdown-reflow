@@ -547,11 +547,29 @@ fn node_into_spans(mut node: Node, src: &str, spans: &mut Vec<Span>) {
         | Node::Delete(_)
         | Node::Link(_)
         | Node::LinkReference(_) => {
+            let closes_after_break =
+                matches!(node, Node::Emphasis(_) | Node::Strong(_) | Node::Delete(_))
+                    && node
+                        .children()
+                        .and_then(|children| children.last())
+                        .is_some_and(|last| matches!(last, Node::Break(_)));
             let mut children = Vec::new();
             for child in node.children_mut().map(std::mem::take).unwrap_or_default() {
                 node_into_spans(child, src, &mut children);
             }
-            spans.push(Span::Container(node, children));
+            if closes_after_break {
+                // A delimiter after a hard break cannot close emphasis:
+                // its preceding character is whitespace. markdown 1.0.0
+                // can instead use a block quote's `>` as that character.
+                // Keep the delimiters as text so block-start escaping also
+                // handles a lone `*`, including its width, on this pass.
+                let marker = delimiter(&node, src).to_string();
+                spans.push(Span::Text(marker.clone()));
+                spans.extend(children);
+                spans.push(Span::Text(marker));
+            } else {
+                spans.push(Span::Container(node, children));
+            }
         }
         _ => spans.push(Span::Void(node)),
     }
@@ -3914,6 +3932,58 @@ mod tests {
         for input in ["x\\  \ny\n", "a **  \nb**\n", "a **\\\nb**\n"] {
             assert_eq!(reflow(input, Options::default()).unwrap(), input);
         }
+    }
+
+    #[test]
+    fn hard_break_before_lone_asterisk_in_quote_is_a_fixed_point() {
+        let widths = [
+            ReflowWidth::Disabled,
+            ReflowWidth::Infinite,
+            ReflowWidth::Finite(6),
+            ReflowWidth::Finite(20),
+            ReflowWidth::Finite(80),
+        ];
+        for (input, expected) in [
+            (">*c  \n>*\n", "> *c\\\n> \\*\n"),
+            (">*c\\\n>*\n", "> *c\\\n> \\*\n"),
+            ("> *c  \n> *\n", "> *c\\\n> \\*\n"),
+            (">*c  \n> *\n", "> *c\\\n> \\*\n"),
+            ("> *c  \n>*\n", "> *c\\\n> \\*\n"),
+            (">**c  \n>**\n", "> **c\\\n> **\n"),
+            (">_c  \n>_\n", "> _c\\\n> _\n"),
+            (">~~c  \n>~~\n", "> ~~c\\\n> ~~\n"),
+            (">>*c  \n>>*\n", "> > *c\\\n> > \\*\n"),
+            ("* >*c  \n  >*\n", "* > *c\\\n  > \\*\n"),
+            ("* a\n\n>*c  \n>*\n", "* a\n\n> *c\\\n> \\*\n"),
+            ("* a\n\nb  \n\\*\n", "* a\n\nb\\\n\\*\n"),
+        ] {
+            for width in widths {
+                let options = Options {
+                    widths: EdgeWidths {
+                        first: width,
+                        middle: width,
+                        last: width,
+                        single: width,
+                    },
+                    ..Options::default()
+                };
+                let output = reflow(input, options).unwrap();
+                assert_eq!(output, expected, "input {input:?}, width {width:?}");
+                assert_eq!(reflow(&output, options).unwrap(), output);
+            }
+        }
+    }
+
+    #[test]
+    fn lone_asterisk_in_quote_fuzz_regression() {
+        // Fuzz case u_17932, seed 23, unlimited width.
+        let input = "    - : \\_ \\\\ word ![i](p)\n\n>c https://a.b/c_d < [link](u) **<span>\n>~~del~~\n😀 ***c*** ## [ref]  \n>*\n3) !: é # `<  \n";
+        let output = reflow(input, Options::default()).unwrap();
+        assert_eq!(
+            output,
+            "```\n- : \\_ \\\\ word ![i](p)\n```\n\n> c https://a.b/c_d < [link](u) **<span> ~~del~~ 😀 ***c*** ## [ref]\\\n> \\*\n\n3. !: é # `<\n"
+        );
+        assert_eq!(reflow(&output, Options::default()).unwrap(), output);
     }
 
     #[test]
