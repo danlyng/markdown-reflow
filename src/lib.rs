@@ -1,5 +1,6 @@
 use markdown::mdast::*;
 use markdown::unist::Position;
+use std::cmp::Reverse;
 use std::fmt::Write;
 
 /// Whether to wrap, join soft breaks, or leave existing line breaks alone.
@@ -53,6 +54,15 @@ impl EdgeWidths {
     fn reflow_disabled(self) -> bool {
         [self.first, self.middle, self.last, self.single].contains(&ReflowWidth::Disabled)
     }
+
+    fn line_budget(self, index: usize, count: usize) -> ReflowWidth {
+        match (index == 0, index + 1 == count) {
+            (true, true) => self.single,
+            (true, false) => self.first,
+            (false, true) => self.last,
+            (false, false) => self.middle,
+        }
+    }
 }
 
 /// Reflow configuration. Defaults to unlimited width, no linkification, and
@@ -85,9 +95,11 @@ impl Default for Options {
 /// Paragraphs are reflowed while block structure and explicit hard breaks are
 /// preserved, and the output parses to the same Markdown as the input apart
 /// from soft break placement: text keeps its escapes and character
-/// references. Inserted line breaks never start a line with block syntax, such
-/// as a list marker, and never split text that had no whitespace; a line
-/// overflows its budget instead. Recognized YAML and TOML frontmatter contents
+/// references. Inserted line breaks never introduce block syntax, such as a
+/// list marker, and never split text that had no whitespace. Finite paragraph
+/// budgets prefer shorter lines to overflow, revisiting earlier breaks when
+/// necessary. Overflow is minimized when no safe layout fits, such as for an
+/// indivisible word or Markdown syntax group. Recognized frontmatter contents
 /// are kept without reflow or linkification. With the default options,
 /// existing soft breaks are joined without inserting new ones. To wrap
 /// uniformly, set all four width budgets alike.
@@ -516,6 +528,8 @@ fn delimiter<'a>(node: &Node, src: &'a str) -> &'a str {
 enum Span {
     /// Markdown source text.
     Text(String),
+    /// Literal source that must stay together, such as a task checkbox.
+    Literal(String),
     /// A hard line break (backslash-newline or two-spaces-newline in source).
     Break(Break),
     /// An inline node that cannot be split across lines, such as a code
@@ -581,7 +595,7 @@ fn spans_into_nodes(spans: Vec<Span>) -> Vec<Node> {
 
 fn span_into_node(span: Span) -> Node {
     match span {
-        Span::Text(value) => Node::Text(Text {
+        Span::Text(value) | Span::Literal(value) => Node::Text(Text {
             value,
             position: None,
         }),
@@ -661,6 +675,7 @@ fn tokenize(spans: Vec<Span>, breakable: bool, out: &mut Vec<WrapToken>) {
 
 fn tokenize_span(span: Span, breakable: bool, out: &mut Vec<WrapToken>) {
     match span {
+        Span::Literal(s) => out.push(WrapToken::Unbreakable(s)),
         // The parser includes container prefixes in a reference label that
         // spans lines, so the text of a reference used as its own label stays
         // on one line.
@@ -764,8 +779,8 @@ fn line_marks(text: &str) -> u8 {
 
 /// Whether a line of `words` words using exactly these characters is a
 /// setext heading underline, a thematic break, or a table delimiter row.
-/// Lone markers are included, since they would also open an empty list item.
-/// Only `=` underlines cannot contain spaces.
+/// This is a coarse filter; `is_line_block` also checks the minimum length
+/// of thematic breaks. Only `=` underlines cannot contain spaces.
 fn is_line_block_syntax(marks: u8, words: usize) -> bool {
     (marks == EQUALS && words == 1)
         || matches!(marks, STAR | UNDERSCORE)
@@ -773,8 +788,8 @@ fn is_line_block_syntax(marks: u8, words: usize) -> bool {
 }
 
 /// Whether `line` is a setext heading underline, a thematic break, or a
-/// table delimiter row. Unlike `is_line_block_syntax`, which also refuses
-/// lone markers for line breaks, this is exact, since it decides escapes.
+/// table delimiter row, used when escaping an unmovable line start rather
+/// than considering a break between chunks.
 fn is_line_block_text(line: &str) -> bool {
     let underline = |marker: char| !line.is_empty() && line.chars().all(|c| c == marker);
     let delimiter_row = line.contains('-')
@@ -797,6 +812,54 @@ struct Segment {
     breakable: Vec<bool>,
     /// Whether the segment starts its paragraph, and so a block.
     opens_paragraph: bool,
+}
+
+type LineCost = ((usize, usize), Reverse<usize>);
+
+/// Range minima of suffix overflow costs, with later endpoints winning ties.
+/// Only legal break boundaries are inserted.
+struct LineCosts {
+    size: usize,
+    values: Vec<LineCost>,
+}
+
+impl LineCosts {
+    const MISSING: LineCost = ((usize::MAX, usize::MAX), Reverse(0));
+
+    fn new(len: usize) -> Self {
+        let size = len.next_power_of_two();
+        Self {
+            size,
+            values: vec![Self::MISSING; 2 * size],
+        }
+    }
+
+    fn insert(&mut self, index: usize, cost: (usize, usize)) {
+        let mut at = self.size + index;
+        self.values[at] = (cost, Reverse(index));
+        while at > 1 {
+            at /= 2;
+            self.values[at] = self.values[2 * at].min(self.values[2 * at + 1]);
+        }
+    }
+
+    fn best(&self, start: usize, end: usize) -> Option<LineCost> {
+        let (mut start, mut end) = (self.size + start, self.size + end);
+        let mut best = Self::MISSING;
+        while start < end {
+            if start % 2 == 1 {
+                best = best.min(self.values[start]);
+                start += 1;
+            }
+            if end % 2 == 1 {
+                end -= 1;
+                best = best.min(self.values[end]);
+            }
+            start /= 2;
+            end /= 2;
+        }
+        (best != Self::MISSING).then_some(best)
+    }
 }
 
 impl Segment {
@@ -849,7 +912,62 @@ impl Segment {
         let marks = (0..LINE_MARKS)
             .filter(|&bit| through[bit] != before[bit])
             .fold(0, |marks, bit| marks | 1 << bit);
+        if matches!(marks, STAR | UNDERSCORE) {
+            return self.chunks[start..end]
+                .iter()
+                .flat_map(|chunk| chunk.text.chars())
+                .filter(|&c| !matches!(c, ' ' | '\t'))
+                .take(3)
+                .count()
+                == 3;
+        }
         is_line_block_syntax(marks, end - start)
+    }
+
+    /// Once a prefix is a line block, adding words can only stop it being
+    /// one: new marker kinds cannot later disappear. Find that end without
+    /// scanning a potentially long run of punctuation.
+    fn after_line_block(&self, start: usize, end: usize) -> usize {
+        let (mut low, mut high) = (end + 1, self.chunks.len() + 1);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.is_line_block(start, middle) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+
+    /// The forbidden line-block endpoints form one interval. Query around
+    /// that interval instead of rejecting possible endpoints one by one.
+    fn best_line_end(
+        &self,
+        costs: &LineCosts,
+        start: usize,
+        from: usize,
+        to: usize,
+    ) -> Option<LineCost> {
+        let candidate @ (_, Reverse(end)) = costs.best(from, to)?;
+        if !self.is_line_block(start, end) {
+            return Some(candidate);
+        }
+        let (mut low, mut high) = (from, end);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.is_line_block(start, middle) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let after = self.after_line_block(start, end).min(to);
+        costs
+            .best(from, low)
+            .into_iter()
+            .chain(costs.best(after, to))
+            .min()
     }
 
     /// A break before chunk `i` must not end the previous line with a
@@ -875,6 +993,15 @@ impl Segment {
         // Prefix constructs are decided by the line's first word, except that
         // a link reference definition label may span words.
         let next = &self.chunks[i].text;
+        let opens_paragraph = i == 0 && self.opens_paragraph;
+        if next.starts_with('<') && !opens_paragraph {
+            return html_interrupts_paragraph(next);
+        }
+        // Link reference definitions and type-7 HTML cannot interrupt a
+        // paragraph, including after a hard break. Footnotes can.
+        if next.starts_with('[') && !opens_paragraph && !next.starts_with("[^") {
+            return false;
+        }
         if next.starts_with('[') {
             let mut rest = String::new();
             for chunk in &self.chunks[i..] {
@@ -1048,11 +1175,190 @@ impl Segment {
             .or_else(|| (fit + 1..len).find(acceptable))
             .unwrap_or(len)
     }
+
+    /// Repair avoidable overflow, including when another indivisible chunk
+    /// must overflow. Costs count excess characters, then overflowing lines;
+    /// a fitting layout always wins. Range minima of suffix costs avoid
+    /// enumerating every partition of a long paragraph.
+    fn bounded_lines(&self, widths: EdgeWidths) -> Vec<(usize, usize)> {
+        let len = self.chunks.len();
+        if !widths.single.is_exceeded_by(self.width(0, len)) {
+            return vec![(0, len)];
+        }
+        let overflow = |start, end, budget| {
+            let excess = match budget {
+                ReflowWidth::Finite(limit) => self.width(start, end).saturating_sub(limit),
+                _ => 0,
+            };
+            (excess, usize::from(excess > 0))
+        };
+        let add = |a: (usize, usize), b: (usize, usize)| (a.0 + b.0, a.1 + b.1);
+        let mut costs = vec![(0, 0); len];
+        let mut next = vec![len; len];
+        let mut fitting = LineCosts::new(len);
+        let mut overflowing = LineCosts::new(len);
+        for start in (1..len).rev() {
+            if !self.breakable[start] {
+                continue;
+            }
+            let fit = self.offsets[start + 1..len].partition_point(|&offset| {
+                !widths
+                    .middle
+                    .is_exceeded_by(offset - self.offsets[start] - 1)
+            });
+            let upper = start + 1 + fit;
+            let mut best = (overflow(start, len, widths.last), Reverse(len));
+            if let Some(candidate) = self.best_line_end(&fitting, start, start + 1, upper) {
+                best = best.min(candidate);
+            }
+            // For an overflowing line, its cost is the suffix cost plus
+            // offset[end] minus a constant for this start. Store that sum
+            // in a second range-minimum tree to consider every safe end.
+            if let Some((cost, Reverse(end))) = self.best_line_end(&overflowing, start, upper, len)
+            {
+                let ReflowWidth::Finite(limit) = widths.middle else {
+                    unreachable!()
+                };
+                let cost = (cost.0 - self.offsets[start] - 1 - limit, cost.1 + 1);
+                best = best.min((cost, Reverse(end)));
+            }
+            costs[start] = best.0;
+            next[start] = best.1.0;
+            fitting.insert(start, best.0);
+            overflowing.insert(start, (best.0.0 + self.offsets[start], best.0.1));
+        }
+        let mut best = (overflow(0, len, widths.single), Reverse(len));
+        let (mut low, mut high) = (1, len);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.first_line_opens_block(middle) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        for (end, &suffix) in costs.iter().enumerate().skip(low) {
+            if !self.breakable[end] || self.is_line_block(0, end) {
+                continue;
+            }
+            let cost = add(overflow(0, end, widths.first), suffix);
+            best = best.min((cost, Reverse(end)));
+        }
+        let mut end = best.1.0;
+        let mut lines = vec![(0, end)];
+        while end < len {
+            let start = end;
+            end = next[start];
+            lines.push((start, end));
+        }
+        lines
+    }
 }
 
 /// Bound on how much of a line is inspected for a link reference definition;
 /// CommonMark labels hold at most 999 characters.
 const MAX_LABEL_LOOKAHEAD: usize = 1024;
+
+/// HTML blocks of CommonMark types 1–6 can interrupt paragraphs. Complete
+/// tags of other names (type 7), inline tags, and autolinks cannot.
+fn html_interrupts_paragraph(line: &str) -> bool {
+    let Some(after) = line.strip_prefix('<') else {
+        return false;
+    };
+    if after.starts_with("!--")
+        || after.starts_with('?')
+        || after.starts_with("![CDATA[")
+        || after
+            .strip_prefix('!')
+            .and_then(|rest| rest.as_bytes().first())
+            .is_some_and(u8::is_ascii_alphabetic)
+    {
+        return true;
+    }
+    let (tag, closing) = after
+        .strip_prefix('/')
+        .map_or((after, false), |tag| (tag, true));
+    let end = tag.bytes().take_while(u8::is_ascii_alphanumeric).count();
+    let name = &tag[..end];
+    let rest = &tag[end..];
+    let boundary = rest.as_bytes().first();
+    if !closing
+        && ["pre", "script", "style", "textarea"]
+            .iter()
+            .any(|raw| name.eq_ignore_ascii_case(raw))
+        && boundary.is_none_or(|b| matches!(b, b' ' | b'\t' | b'>'))
+    {
+        return true;
+    }
+    const BLOCK_TAGS: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "base",
+        "basefont",
+        "blockquote",
+        "body",
+        "caption",
+        "center",
+        "col",
+        "colgroup",
+        "dd",
+        "details",
+        "dialog",
+        "dir",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "frame",
+        "frameset",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "header",
+        "hr",
+        "html",
+        "iframe",
+        "legend",
+        "li",
+        "link",
+        "main",
+        "menu",
+        "menuitem",
+        "nav",
+        "noframes",
+        "ol",
+        "optgroup",
+        "option",
+        "p",
+        "param",
+        "search",
+        "section",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "title",
+        "tr",
+        "track",
+        "ul",
+    ];
+    BLOCK_TAGS
+        .iter()
+        .any(|block| name.eq_ignore_ascii_case(block))
+        && (boundary.is_none_or(|b| matches!(b, b' ' | b'\t' | b'>')) || rest.starts_with("/>"))
+}
 
 /// Whether a line beginning with `line` would open a block construct rather
 /// than continue a paragraph: a list item, block quote, ATX heading, code
@@ -1225,6 +1531,29 @@ fn wrap_spans(spans: Vec<Span>, widths: EdgeWidths, opens_block: bool, src: &str
 
     if matches!(widths.middle, ReflowWidth::Finite(_)) {
         reserve_final_line_width(&segments, &mut lines, widths);
+        for (index, (segment, lines)) in segments.iter().zip(&mut lines).enumerate() {
+            let first = index == 0;
+            let last = index + 1 == segments.len();
+            let local = EdgeWidths {
+                first: if first { widths.first } else { widths.middle },
+                middle: widths.middle,
+                last: if last { widths.last } else { widths.middle },
+                single: match (first, last) {
+                    (true, true) => widths.single,
+                    (true, false) => widths.first,
+                    (false, true) => widths.last,
+                    (false, false) => widths.middle,
+                },
+            };
+            let overflows = lines.iter().enumerate().any(|(i, &(start, end))| {
+                local
+                    .line_budget(i, lines.len())
+                    .is_exceeded_by(segment.width(start, end))
+            });
+            if overflows {
+                *lines = segment.bounded_lines(local);
+            }
+        }
     }
 
     // 3. Emit the tokens, replacing the whitespace at each break. A wrapped
@@ -1237,12 +1566,7 @@ fn wrap_spans(spans: Vec<Span>, widths: EdgeWidths, opens_block: bool, src: &str
         let spaced: Vec<bool> = segment_lines
             .iter()
             .map(|&(start, end)| {
-                let budget = match (line_index == 0, line_index + 1 == line_count) {
-                    (true, true) => widths.single,
-                    (true, false) => widths.first,
-                    (false, true) => widths.last,
-                    (false, false) => widths.middle,
-                };
+                let budget = widths.line_budget(line_index, line_count);
                 line_index += 1;
                 !matches!(widths.middle, ReflowWidth::Finite(_))
                     || !budget.is_exceeded_by(segment.spaced_width(start, end))
@@ -1392,6 +1716,7 @@ fn reflow_node(
                 prefix_width,
                 initial_line_pending,
                 src,
+                None,
             );
         }
         // Blockquote: content is prefixed with "> " (2 chars) on every line.
@@ -1425,6 +1750,40 @@ fn reflow_node(
             }
         }
         Node::Heading(heading) => reflow_heading(heading, widths, src),
+        Node::ListItem(item) if item.checked.is_some() => {
+            // Include the checkbox in wrapping, rather than adding it after
+            // measuring the paragraph. Its following whitespace can break,
+            // so a narrow first line can hold just the checkbox.
+            let marker = if item.checked == Some(true) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let item_start = item.position.as_ref().map(|position| position.start.offset);
+            let mut pending = true;
+            for child in &mut item.children {
+                if pending && let Node::Paragraph(paragraph) = child {
+                    // The parser advances the paragraph's start past the
+                    // checkbox, so inspect the item's source for this gap.
+                    let newline = item_start
+                        .zip(paragraph.children.first().and_then(Node::position))
+                        .and_then(|(start, first)| src.get(start..first.start.offset))
+                        .and_then(|before| before.rsplit_once(']'))
+                        .is_some_and(|(_, gap)| gap.contains(['\n', '\r']));
+                    reflow_paragraph(
+                        &mut paragraph.children,
+                        widths,
+                        prefix_width,
+                        initial_line_pending,
+                        src,
+                        Some((marker, newline)),
+                    );
+                    pending = false;
+                } else {
+                    reflow_node(child, widths, prefix_width, initial_line_pending, src);
+                }
+            }
+        }
         // A footnote definition's label precedes its first line.
         Node::FootnoteDefinition(definition) => {
             let marker_width = footnote_marker(definition, src).chars().count();
@@ -1465,9 +1824,14 @@ fn reflow_paragraph(
     prefix_width: usize,
     initial_line_pending: &mut bool,
     src: &str,
+    leading: Option<(&str, bool)>,
 ) {
     // 1. Convert all children to spans.
     let mut spans: Vec<Span> = Vec::new();
+    if let Some((marker, newline)) = leading {
+        spans.push(Span::Literal(marker.to_string()));
+        spans.push(Span::Text(if newline { "\n" } else { " " }.to_string()));
+    }
     for child in std::mem::take(children) {
         node_into_spans(child, src, &mut spans);
     }
@@ -2171,9 +2535,6 @@ fn render_list(list: &List, avoid: Option<char>, close: bool, src: &str, out: &m
             let mut inner = String::new();
             match child {
                 Node::ListItem(item) => {
-                    if let Some(checked) = item.checked {
-                        inner.push_str(if checked { "[x] " } else { "[ ] " });
-                    }
                     let spread = separated_by_blank_line(&item.children, item.spread, src);
                     render_flow_children(&item.children, !spread, close, src, &mut inner);
                 }
@@ -2847,6 +3208,162 @@ mod tests {
     }
 
     #[test]
+    fn edge_budgets_choose_a_fitting_layout_when_one_exists() {
+        let options = |[first, middle, last, single]: [usize; 4]| Options {
+            widths: EdgeWidths {
+                first: ReflowWidth::Finite(first),
+                middle: ReflowWidth::Finite(middle),
+                last: ReflowWidth::Finite(last),
+                single: ReflowWidth::Finite(single),
+            },
+            ..Options::default()
+        };
+        for (input, budgets, expected) in [
+            ("long words", [2, 2, 2, 20], "long words\n"),
+            ("a bbbb ccccc", [3, 3, 10, 3], "a\nbbbb ccccc\n"),
+            ("a bbbb ccccc\\\nz", [3, 12, 1, 3], "a\nbbbb ccccc\\\nz\n"),
+        ] {
+            let options = options(budgets);
+            let output = reflow(input, options).unwrap();
+            assert_eq!(output, expected);
+            assert_eq!(reflow(&output, options).unwrap(), output);
+        }
+
+        // Enumerate all partitions independently of the wrapper. For small
+        // plain-text paragraphs, this is an exhaustive feasibility oracle.
+        let mut state = 0x1c69_b3f7_4ac4_ae35_u64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % bound
+        };
+        for _ in 0..1000 {
+            let words: Vec<_> = (0..1 + next(7)).map(|_| "a".repeat(1 + next(7))).collect();
+            let budgets = [next(16), next(16), next(16), next(16)];
+            let options = options(budgets);
+            let minimum_excess = (0..1 << (words.len() - 1))
+                .map(|mask| {
+                    let mut lengths = vec![words[0].len()];
+                    for (i, word) in words.iter().enumerate().skip(1) {
+                        if mask & (1 << (i - 1)) != 0 {
+                            lengths.push(word.len());
+                        } else {
+                            *lengths.last_mut().unwrap() += 1 + word.len();
+                        }
+                    }
+                    lengths
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &length)| {
+                            let ReflowWidth::Finite(limit) =
+                                options.widths.line_budget(i, lengths.len())
+                            else {
+                                unreachable!()
+                            };
+                            length.saturating_sub(limit)
+                        })
+                        .sum::<usize>()
+                })
+                .min()
+                .unwrap();
+            let input = words.join(" ");
+            let output = reflow(&input, options).unwrap();
+            let lines: Vec<_> = output.lines().collect();
+            let excess = lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let ReflowWidth::Finite(limit) = options.widths.line_budget(i, lines.len())
+                    else {
+                        unreachable!()
+                    };
+                    line.len().saturating_sub(limit)
+                })
+                .sum::<usize>();
+            assert_eq!(
+                excess, minimum_excess,
+                "avoidable overflow with {budgets:?}: {input:?} -> {output:?}"
+            );
+            assert_eq!(output.split_whitespace().collect::<Vec<_>>(), words);
+            assert_eq!(reflow(&output, options).unwrap(), output);
+        }
+    }
+
+    #[test]
+    fn overflow_fallback_matches_all_legal_partitions() {
+        const WORDS: &[&str] = &[
+            "a", "bb", "---", "___", "_", "|", "-", "--", "-:", "|-|", "=", "==", "**", "<span>",
+            "<div>", "[x]:", "foo\\",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % bound
+        };
+        for _ in 0..1000 {
+            let mut words = vec!["Start"];
+            words.extend((0..next(7)).map(|_| WORDS[next(WORDS.len())]));
+            let segment = Segment::new(
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(i, word)| Chunk {
+                        space: if i == 0 { "" } else { " " }.to_string(),
+                        tokens: vec![WrapToken::Word(word.to_string())],
+                        text: word.to_string(),
+                        width: word.len(),
+                    })
+                    .collect(),
+                true,
+            );
+            let widths = EdgeWidths {
+                first: ReflowWidth::Finite(next(20)),
+                middle: ReflowWidth::Finite(next(20)),
+                last: ReflowWidth::Finite(next(20)),
+                single: ReflowWidth::Finite(next(20)),
+            };
+            let score = |lines: &[(usize, usize)]| {
+                let mut cost = (0, 0);
+                for (i, &(start, end)) in lines.iter().enumerate() {
+                    let ReflowWidth::Finite(limit) = widths.line_budget(i, lines.len()) else {
+                        unreachable!()
+                    };
+                    let excess = segment.width(start, end).saturating_sub(limit);
+                    cost.0 += excess;
+                    cost.1 += usize::from(excess > 0);
+                }
+                cost
+            };
+            let minimum = (0..1 << (words.len() - 1))
+                .filter_map(|mask| {
+                    let mut lines = Vec::new();
+                    let mut start = 0;
+                    for end in 1..words.len() {
+                        if mask & (1 << (end - 1)) != 0 {
+                            if !segment.allows_line(start, end) {
+                                return None;
+                            }
+                            lines.push((start, end));
+                            start = end;
+                        }
+                    }
+                    lines.push((start, words.len()));
+                    Some(score(&lines))
+                })
+                .min()
+                .unwrap();
+            let lines = segment.bounded_lines(widths);
+            for &(start, end) in lines.iter().take(lines.len() - 1) {
+                assert!(segment.allows_line(start, end));
+            }
+            assert_eq!(score(&lines), minimum, "{words:?}, {widths:?}, {lines:?}");
+        }
+    }
+
+    #[test]
     fn test_headings_not_combined() {
         let input = "# Hello\n# World\n";
         let result = reflow(input, uniform_options(80)).unwrap();
@@ -3358,6 +3875,38 @@ mod tests {
     }
 
     #[test]
+    fn task_list_checkboxes_count_toward_the_first_line_width() {
+        for (input, expected) in [
+            ("* [ ] alpha beta gamma\n", "* [ ] alpha\n  beta gamma\n"),
+            ("* [x] alpha beta gamma\n", "* [x] alpha\n  beta gamma\n"),
+            (
+                "> * [ ] one two three\n",
+                "> * [ ] one\n>   two\n>   three\n",
+            ),
+            (
+                "* [ ] alpha\\\nbeta gamma\n",
+                "* [ ] alpha\\\n  beta gamma\n",
+            ),
+        ] {
+            let options = uniform_options(12);
+            let output = reflow(input, options).unwrap();
+            assert_eq!(output, expected);
+            assert!(output.lines().all(|line| line.chars().count() <= 12));
+            assert_eq!(meaning(&output, options), meaning(input, options));
+            assert_eq!(reflow(&output, options).unwrap(), output);
+        }
+        let input = "* [ ] todo\n";
+        let output = reflow(input, uniform_options(6)).unwrap();
+        assert_eq!(output, "* [ ]\n  todo\n");
+        assert_eq!(
+            meaning(&output, uniform_options(6)),
+            meaning(input, uniform_options(6))
+        );
+        assert_eq!(reflow(&output, uniform_options(6)).unwrap(), output);
+        assert_eq!(reflow(&output, disabled()).unwrap(), output);
+    }
+
+    #[test]
     fn test_blockquote_respects_width() {
         let input =
             "> This is a blockquote that should be reflowed to stay within the character limit.\n";
@@ -3400,7 +3949,7 @@ mod tests {
                 "aa\nbb ```\ncc ~~~\ndd $$\nee\n",
             ),
             ("aa bb <div> cc </p> dd", 6, "aa\nbb <div>\ncc </p>\ndd\n"),
-            ("aaa bb [x]: cc", 6, "aaa\nbb [x]:\ncc\n"),
+            ("aaa bb [x]: cc", 6, "aaa bb\n[x]:\ncc\n"),
             ("aa bb [^1]: cc", 6, "aa\nbb [^1]:\ncc\n"),
             // Setext underlines, thematic breaks, and table delimiter rows
             // depend on the whole line.
@@ -3408,7 +3957,7 @@ mod tests {
             ("aaa bb ==", 6, "aaa\nbb ==\n"),
             // An underline of `=` cannot contain spaces.
             ("aaa bb == ==", 6, "aaa bb\n== ==\n"),
-            ("aaa bb --- cc ___", 6, "aaa bb\n--- cc ___\n"),
+            ("aaa bb --- cc ___", 6, "aaa\nbb ---\ncc ___\n"),
             ("aaa bb cc ___ ___", 6, "aaa bb\ncc ___ ___\n"),
             ("ab | - | - |", 7, "ab | - | -\n|\n"),
         ] {
@@ -3490,8 +4039,78 @@ mod tests {
         assert_eq!(reflow(input, Options::default()).unwrap(), input);
         assert_eq!(
             reflow("aa <span>x</span> bb\n", uniform_options(8)).unwrap(),
-            "aa <span>x</span>\nbb\n"
+            "aa\n<span>x</span>\nbb\n"
         );
+    }
+
+    #[test]
+    fn safe_continuations_underfill_instead_of_overflowing() {
+        for (input, width, expected) in [
+            (
+                "aaaa bbbb <span>x</span> cccc dddd\n",
+                10,
+                "aaaa bbbb\n<span>x</span>\ncccc dddd\n",
+            ),
+            ("aaaa <span> bbbb\n", 6, "aaaa\n<span>\nbbbb\n"),
+            ("aaaa </span> bbbb\n", 7, "aaaa\n</span>\nbbbb\n"),
+            ("aaaa <a:b> bbbb\n", 6, "aaaa\n<a:b>\nbbbb\n"),
+            ("aaaa [x]: u bbbb\n", 6, "aaaa\n[x]: u\nbbbb\n"),
+            ("aaaa [x y]: u bbbb\n", 9, "aaaa [x\ny]: u\nbbbb\n"),
+            ("aa _ bb\n", 2, "aa\n_\nbb\n"),
+            ("aa ** bb\n", 2, "aa\n**\nbb\n"),
+            (
+                "aaaaaaaaaaaa aaa bb --- cc ___\n",
+                6,
+                "aaaaaaaaaaaa\naaa\nbb ---\ncc ___\n",
+            ),
+        ] {
+            let options = uniform_options(width);
+            let output = reflow(input, options).unwrap();
+            assert_eq!(output, expected);
+            for line in output.lines().filter(|line| line.chars().count() > width) {
+                assert!(
+                    matches!(line, "<span>x</span>" | "aaaaaaaaaaaa"),
+                    "avoidable overflow: {line:?}"
+                );
+            }
+            assert_eq!(meaning(&output, options), meaning(input, options));
+            assert_eq!(reflow(&output, options).unwrap(), output);
+        }
+    }
+
+    #[test]
+    fn html_line_start_guards_follow_paragraph_interruption_rules() {
+        for (html, interrupts) in [
+            ("<script>", true),
+            ("<PRE", true),
+            ("<textarea>", true),
+            ("<!--x-->", true),
+            ("<?x?>", true),
+            ("<!DOCTYPE html>", true),
+            ("<![CDATA[x]]>", true),
+            ("<DIV>", true),
+            ("</table>", true),
+            ("<div/>", true),
+            ("<div/", false),
+            ("<div-x>", false),
+            ("<diversion>", false),
+            ("<span>", false),
+            ("</pre>", false),
+            ("<script/>", false),
+            ("<http://x>", false),
+            ("<!>", false),
+        ] {
+            assert_eq!(html_interrupts_paragraph(html), interrupts, "{html:?}");
+            let input = format!("aaaa bbbb {html} cccc dddd\n");
+            let options = uniform_options(10);
+            let output = reflow(&input, options).unwrap();
+            assert_eq!(
+                meaning(&output, options),
+                meaning(&input, options),
+                "{html:?}"
+            );
+            assert_eq!(reflow(&output, options).unwrap(), output, "{html:?}");
+        }
     }
 
     #[test]
@@ -4225,6 +4844,13 @@ mod tests {
         "> > a|\n> >\n\n| a | b |\n| - | - |\n| c | d |\n",
         "| a | b |\n| :- | -: |\n| `x\\|y` | c \\| d |\n| e |\n| f | g | h |\n",
         "| *a* | [b](c) |\n| :-: | --- |\n| `|` | \\\\ |\n",
+        // Safe continuation lines and measured task checkboxes.
+        "aaaa bbbb <span>x</span> cccc dddd\n",
+        "aaaa <http://example.com> bbbb\n",
+        "aaaa [x]: u bbbb\n",
+        "aa _ bb and ** cc\n",
+        "* [ ] todo\n* [x] a b c\n",
+        "* [ ]\n  todo\n",
         // Footnotes and code blocks.
         "Text[^1].\n\n[^1]: First.\n\n    Second paragraph.\n[^2]: Other.\n",
         "```\n```\n\n```text\na\n\n```\n\n````\n```\n````\n\n~~~ a`b\nx\n~~~\n\n    indented\n",
