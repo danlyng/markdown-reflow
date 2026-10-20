@@ -1691,21 +1691,6 @@ fn render_flow_children(children: &[Node], tight: bool, close: bool, src: &str, 
 /// `next` started such a block or an empty quote line came first. Without
 /// `next`, the line after the node's container follows.
 fn closes_quoted_paragraph(node: &Node, next: Option<&Node>, src: &str) -> bool {
-    fn ends_in_quoted_paragraph(node: &Node, quoted: bool) -> bool {
-        match node {
-            Node::Paragraph(_) => quoted,
-            Node::Blockquote(_)
-            | Node::List(_)
-            | Node::ListItem(_)
-            | Node::FootnoteDefinition(_) => {
-                let quoted = quoted || matches!(node, Node::Blockquote(_));
-                node.children()
-                    .and_then(|children| children.last())
-                    .is_some_and(|last| ends_in_quoted_paragraph(last, quoted))
-            }
-            _ => false,
-        }
-    }
     if !ends_in_quoted_paragraph(node, false) {
         return false;
     }
@@ -1715,6 +1700,21 @@ fn closes_quoted_paragraph(node: &Node, next: Option<&Node>, src: &str) -> bool 
     let mut rendered = String::new();
     render_node(next, false, src, &mut rendered);
     !interrupts_paragraph(rendered.lines().next().unwrap_or(""))
+}
+
+/// Whether the last block is a paragraph inside a block quote, possibly
+/// nested in lists, footnotes, or further quotes.
+fn ends_in_quoted_paragraph(node: &Node, quoted: bool) -> bool {
+    match node {
+        Node::Paragraph(_) => quoted,
+        Node::Blockquote(_) | Node::List(_) | Node::ListItem(_) | Node::FootnoteDefinition(_) => {
+            let quoted = quoted || matches!(node, Node::Blockquote(_));
+            node.children()
+                .and_then(|children| children.last())
+                .is_some_and(|last| ends_in_quoted_paragraph(last, quoted))
+        }
+        _ => false,
+    }
 }
 
 /// Whether a line starting with `line` certainly interrupts a paragraph: a
@@ -1835,7 +1835,15 @@ fn render_node(node: &Node, close: bool, src: &str, out: &mut String) {
             let mut inner = String::new();
             render_flow_children(&bq.children, false, false, src, &mut inner);
             // An empty quote line closes the quote's last paragraph.
-            if close {
+            // markdown 1.0.0 also needs it after an unescaped trailing pipe:
+            // otherwise its pending table header state leaks out of the
+            // quote and adds a column to a later table's header count. A
+            // blank line outside the quote does not clear that state.
+            let tail = inner.trim_end_matches([' ', '\t', '\r', '\n']);
+            let pending_table = ends_in_quoted_paragraph(node, false)
+                && tail.ends_with('|')
+                && !is_escaped(tail, tail.len() - 1);
+            if close || pending_table {
                 inner.push('\n');
             }
             push_prefixed(&inner, "> ", "> ", out);
@@ -3144,6 +3152,77 @@ mod tests {
     }
 
     #[test]
+    fn quoted_trailing_pipes_do_not_hide_later_tables() {
+        let table = "| a   | b   |\n| --- | --- |\n| c   | d   |\n";
+        for quote in [
+            "> a|\n>\n",
+            "> |\n>\n",
+            "> a\\\\|\n>\n",
+            "> * a|\n>\n",
+            "> > a|\n> >\n",
+            "* > a|\n  >\n",
+            "1. > a|\n   >\n",
+        ] {
+            // An empty quote line clears the parser's pending table header.
+            // Keep it even when a blank line separates the following block.
+            for between in ["\n", "\n```\ncode\n```\n\n", "\n# Heading\n\n"] {
+                let input = format!("{quote}{between}{table}");
+                let output = reflow(&input, uniform_options(20)).unwrap();
+                assert_eq!(output, input, "quote {quote:?}, between {between:?}");
+                assert_eq!(reflow(&output, uniform_options(20)).unwrap(), output);
+                assert_eq!(
+                    meaning(&output, uniform_options(20)),
+                    meaning(&input, uniform_options(20))
+                );
+            }
+        }
+        // Escaped pipes and pipes inside code or actual tables do not
+        // leave a pending header, so they need no extra quote line.
+        for quote in [
+            "> a\\|\n",
+            "> a&#124;\n",
+            "> `|`\n",
+            "> | a   |\n> | --- |\n> | b   |\n",
+        ] {
+            let input = format!("{quote}\n{table}");
+            let output = reflow(&input, uniform_options(20)).unwrap();
+            assert_eq!(output, input);
+            assert_eq!(reflow(&output, uniform_options(20)).unwrap(), output);
+        }
+    }
+
+    #[test]
+    fn table_after_quoted_pipe_fuzz_regression() {
+        // Fuzz case u_4923, seed 22: reflow used to remove the empty quote
+        // line that reset table detection, destroying the table on pass 2.
+        let input = "> > éé alpha `code` éé [^n] c\n1. > --- # word ---`code`|\n>\n\t & *em* \\* <span>\n| a | b |\n| - | - |\n| = éé [ 😀\n\n  * ## *em* \t $ ***c***  \n  * & `` a`b `` éé\n  \n[ \\\\ ~~del~~ \\\n";
+        let options = uniform_options(20);
+        let output = reflow(input, options).unwrap();
+        assert_eq!(
+            output,
+            "> > éé alpha `code`\n> > éé [^n] c\n\n1. > --- # word\n   > ---`code`|\n   >\n\n>\n\n```\n & *em* \\* <span>\n```\n\n| a        | b   |\n| -------- | --- |\n| = éé [ 😀 |     |\n\n* ## *em*   $ ***c***\n* & `` a`b `` éé\n\n[ \\\\ ~~del~~ \\\n"
+        );
+        assert_eq!(reflow(&output, options).unwrap(), output);
+        // The parser changes an item's spread flag for the added quote
+        // line, even though the item holds only a quote. Compare HTML here
+        // to check its rendered meaning, allowing reflowed whitespace.
+        let html = |source| {
+            markdown::to_html_with_options(
+                source,
+                &markdown::Options {
+                    parse: parse_options(options),
+                    ..markdown::Options::default()
+                },
+            )
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        assert_eq!(html(&output), html(input));
+    }
+
+    #[test]
     fn test_table_column_padding_is_preserved() {
         // Human-readable alignment padding must survive a round trip.
         let input = "\
@@ -4071,6 +4150,9 @@ mod tests {
         "para\n<div>\nblock\n</div>\n\nafter\n",
         "para\n\n<!-- comment -->\nmore\n",
         // Tables.
+        "> a|\n>\n\n| a | b |\n| - | - |\n| c | d |\n",
+        "> * a|\n>\n\n| a | b |\n| - | - |\n| c | d |\n",
+        "> > a|\n> >\n\n| a | b |\n| - | - |\n| c | d |\n",
         "| a | b |\n| :- | -: |\n| `x\\|y` | c \\| d |\n| e |\n| f | g | h |\n",
         "| *a* | [b](c) |\n| :-: | --- |\n| `|` | \\\\ |\n",
         // Footnotes and code blocks.
