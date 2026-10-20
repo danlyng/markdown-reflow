@@ -17,6 +17,7 @@ let options = Options {
         single: ReflowWidth::Finite(80),
     },
     linkify_urls: false,
+    frontmatter: true,
 };
 let output = reflow("Some Markdown to reflow.", options)?;
 ```
@@ -32,11 +33,15 @@ Set all four budgets alike for uniform wrapping. Set different budgets to reserv
 
 - `Finite(usize)`: wrap at the given width. Zero is a literal zero-width budget; indivisible content such as a word can still exceed it.
 - `Infinite`: join existing soft breaks without inserting new ones. An infinite `middle` ignores the other budgets.
-- `Disabled`: skip reflow, preserving existing paragraph soft breaks while still applying other transformations. Setting any of the four budgets to `Disabled` disables reflow for the entire document.
+- `Disabled`: skip reflow, preserving existing paragraph soft breaks while still applying other transformations. Setting any of the four budgets to `Disabled` disables reflow for the entire document. A soft break is joined only where the rendered line would start with block syntax, as a lazy continuation line can once it gains its container's prefix, or where a paragraph's first line would become an HTML block or a link reference definition.
 
-`Options::default()` uses `Infinite` for all budgets and leaves linkification disabled. Explicit hard breaks remain intact in every mode.
+`Options::default()` uses `Infinite` for all budgets, leaves linkification disabled, and recognizes frontmatter. Explicit hard breaks remain intact in every mode.
 
-YAML (`---`) and TOML (`+++`) frontmatter at the start of the input is recognized when a matching closing fence is present. The frontmatter block is copied from the source, preserving indentation, comments, blank lines, and multiline values without reflow or linkification. The renderer adds a final newline if needed and normalizes spacing between Markdown blocks.
+Wrapping breaks lines only at existing whitespace and never starts a line with Markdown block syntax, such as a list marker, block quote, heading, code fence, HTML block, link reference definition, setext underline, thematic break, or table delimiter row. It also never ends a line with a backslash, which would become a hard break, and never breaks inside a shortcut or collapsed reference, whose text is its label. When no acceptable break fits the budget, the line overflows instead. A line that cannot move, such as one after a hard break, has its leading block syntax escaped instead. Widths count the rendered Markdown, including link destinations and code span backticks. Line breaks are chosen as if words were separated by single spaces, and a wrapped line keeps wider spacing, such as two spaces after a sentence, only if it still fits; this keeps the output a fixed point.
+
+The output parses to the same Markdown as the input, apart from where soft breaks fall. Text keeps its source spelling, including backslash escapes and character references, and so do emphasis delimiters (`*` or `_`), code spans, images, autolinks, and reference labels. Other syntax is normalized: bullets become `*`, ordered lists use `.`, setext headings without hard breaks become ATX headings, code blocks are fenced, link destinations and titles are re-encoded, and tables are padded. Adjacent lists alternate markers (`-`, `)`) so they stay separate, loose lists and items keep their blank lines, a block quote in a tight item ends with an empty quote line where the next line would otherwise continue its last paragraph, and definitions and HTML blocks keep the blank lines that separate them from paragraphs. Reflowing the output again leaves it unchanged.
+
+YAML (`---`) and TOML (`+++`) frontmatter at the start of the input is recognized when a matching closing fence is present. The frontmatter block is copied from the source, preserving indentation, comments, blank lines, and multiline values without reflow or linkification. The renderer adds a final newline if needed and normalizes spacing between Markdown blocks. Set `frontmatter: false` for Markdown fragments, such as documentation comments, where leading `---` or `+++` lines are a thematic break, a setext underline, or paragraph text.
 
 For example, linkify without reflowing:
 
@@ -47,12 +52,15 @@ let output = reflow(input, Options {
         ..EdgeWidths::default()
     },
     linkify_urls: true,
+    ..Options::default()
 })?;
 ```
 
-`linkify_urls: true` converts bare URL, `www.`, and email autolink literals into Markdown links. Table formatting and Markdown syntax normalization also still apply when reflow is disabled; this mode does not preserve source formatting byte for byte. The return type is `Result<String, String>`.
+`linkify_urls: true` converts bare URL, `www.`, and email autolink literals into Markdown links. Text already inside a link is left alone, and a URL stays bare where brackets would change its neighbors, such as after `!` or next to an emphasis delimiter. Table formatting and Markdown syntax normalization also still apply when reflow is disabled; this mode does not preserve source formatting byte for byte. The return type is `Result<String, String>`.
 
 Version 0.5 replaces the `Option<usize>` fields in `EdgeWidths` with `ReflowWidth`. Replace `Some(width)` with `ReflowWidth::Finite(width)` and `None` with `ReflowWidth::Infinite`; use `ReflowWidth::Disabled` to skip reflow. The CLI now also defaults to `Infinite` when width is omitted; zero and negative widths still select `Infinite`.
+
+Version 0.8 adds the `frontmatter` field to `Options`. A struct literal that names every field needs `frontmatter: true` to keep the earlier behavior, or `..Options::default()` to fill it in; set `frontmatter: false` for Markdown fragments such as documentation comments.
 
 ## CLI
 
